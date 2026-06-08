@@ -1,0 +1,16 @@
+# TEST PLAIN TEXT PASSWORD IN DB
+docker compose exec db psql -U $POSTGRES_USER -d $POSTGRES_DB
+SELECT username, password FROM users_user;
+
+# TEST FORM VALIDATION SHORT PASSWORD
+curl -X POST http://localhost:8000/api/register/ \
+  -H "Content-Type: application/json" \
+  -d '{"username":"test","email":"test@example.com","first_name":"T","last_name":"T","password":"short"}'
+
+# SQL INJECTIONS
+Pour la bdd, j’utilise uniquement l’ORM Django (pas de SQL brut). Il génère des requêtes paramétrées,
+donc les entrées utilisateur sont traitées comme données et ne peuvent pas injecter de SQL.
+
+# XSS PROTECTION
+Côté XSS, le frontend React/Next.js affiche les données utilisateur comme texte échappé, donc même si quelqu’un met du <script>,
+il n’est jamais exécuté, juste affiché.

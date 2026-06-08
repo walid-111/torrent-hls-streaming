@@ -1,0 +1,73 @@
+@import url('https://fonts.googleapis.com/css2?family=Spectral:wght@400;600;700&display=swap');
+@import "tailwindcss";
+
+:root {
+  --bg: #f4f1ea;
+  --surface: #fffdf8;
+  --ink: #1c1a17;
+  --muted: #6b655c;
+  --accent: #8a3324;
+  --accent-hover: #6e2820;
+  --border: #ddd6c9;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: ui-sans-serif, system-ui, sans-serif;
+}
+
+h1, h2, h3 {
+  font-family: 'Spectral', Georgia, serif;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.input {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5rem 0.75rem;
+  width: 100%;
+}
+
+.input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.btn {
+  background: var(--accent);
+  color: #fff;
+  padding: 0.5rem 1rem;
+  border-radius: 4px;
+}
+
+.btn:hover {
+  background: var(--accent-hover);
+}
+
+.link {
+  color: var(--accent);
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.spinner {
+  width: 22px;
+  height: 22px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.6s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}

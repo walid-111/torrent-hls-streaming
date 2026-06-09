@@ -84,21 +84,16 @@ def search_archive(query, page=1, min_year=None, min_rating=None):
 
 
 def search_publicdomain_torrents(query, page=1, min_year=None, min_rating=None):
-    """
-    Simple scraper pour PublicDomainTorrents.
-    Pas de vraie pagination côté site, donc on fait une pagination maison.
-    """
     base = "https://www.publicdomaintorrents.info"
     list_url = f"{base}/nshowcat.html?category=ALL"
 
     try:
-        html = requests.get(list_url, timeout=10).text
+        html = requests.get(list_url, timeout=5).text
     except Exception:
         return []
 
     soup = BeautifulSoup(html, 'html.parser')
 
-    # Récupère tous les liens vers nshowmovie.html
     links = []
     for a in soup.find_all('a', href=True):
         href = a['href']
@@ -106,7 +101,6 @@ def search_publicdomain_torrents(query, page=1, min_year=None, min_rating=None):
             title = a.get_text(strip=True)
             if not title:
                 continue
-            # Si query fournie, filtrer côté titre
             if query and query.lower() not in title.lower():
                 continue
             links.append({
@@ -117,25 +111,19 @@ def search_publicdomain_torrents(query, page=1, min_year=None, min_rating=None):
     if not links:
         return []
 
-    # Pagination "maison"
-    per_page = 10
+    per_page = 5
     start = (page - 1) * per_page
-    end = start + per_page
-    subset = links[start:end]
+    subset = links[start:start + per_page]
 
     results = []
     for item in subset:
-        detail_url = item['url']
-        title = item['title']
-
         try:
-            detail_html = requests.get(detail_url, timeout=10).text
+            detail_html = requests.get(item['url'], timeout=5).text
         except Exception:
             continue
 
         detail = BeautifulSoup(detail_html, 'html.parser')
 
-        # Cherche lien .torrent
         torrent_url = None
         for a in detail.find_all('a', href=True):
             href = a['href']
@@ -145,32 +133,38 @@ def search_publicdomain_torrents(query, page=1, min_year=None, min_rating=None):
         if not torrent_url:
             continue
 
-        # Résumé / année très basique (le HTML du site est old-school)
         summary = ''
-        year = None
-
-        # Exemple : souvent le synopsis est dans des <p> ou <font>
         paras = detail.find_all('p')
         if paras:
             summary = paras[0].get_text(strip=True)
 
-        # Si tu veux tenter d'extraire une année du titre ou du texte :
-        if not year:
-            import re
-            m = re.search(r'\b(19\d{2}|20\d{2})\b', title)
-            if m:
-                year = m.group(1)
+        year = None
+        m = re.search(r'\b(19\d{2}|20\d{2})\b', item['title'])
+        if m:
+            year = m.group(1)
 
-        rating, casting = _tmdb(title)
+        rating, casting = _tmdb(item['title'])
         if min_rating and (not rating or float(rating) < float(min_rating)):
             continue
-        if min_year and year and str(year).isdigit() and int(year) < int(min_year):
+        if min_year and year and int(year) < int(min_year):
             continue
-
+        
+        cover = ''
+        try:
+            tmdb_search = requests.get(
+                'https://api.themoviedb.org/3/search/movie',
+                params={'api_key': os.getenv('TMDB_API_KEY'), 'query': item['title']},
+                timeout=3
+            ).json().get('results', [])
+            if tmdb_search and tmdb_search[0].get('poster_path'):
+                cover = f"https://image.tmdb.org/t/p/w500{tmdb_search[0]['poster_path']}"
+        except:
+            pass
+        
         results.append({
-            'title': title,
-            'magnet': torrent_url,  # c'est une URL .torrent, pas un magnet
-            'cover': None,          # pas d'image fiable sur ce site
+            'title': item['title'],
+            'magnet': torrent_url,
+            'cover': cover,
             'year': year,
             'rating': rating,
             'summary': summary,
@@ -186,7 +180,6 @@ def search_all(query, page=1, min_year=None, min_rating=None):
         return []
     results = search_archive(query, page, min_year, min_rating)
     if page <= 3:
-        results += search_archive(query, page, min_year, min_rating)
         results += search_publicdomain_torrents(query, page, min_year, min_rating)
     if query:
         results.sort(key=lambda r: r['title'].lower())
@@ -222,7 +215,6 @@ def _get_duration(filepath):
 
 
 def _load_torrent_info(torrent_url):
-    """Load torrent_info from .torrent file URL"""
     if torrent_url.startswith('magnet:'):
         params = lt.parse_magnet_uri(torrent_url)
         params.save_path = DOWNLOAD_PATH
@@ -267,7 +259,6 @@ def start_download(torrent_url, movie_id):
         print(f"Movie {movie_id}: failed to load torrent", flush=True)
         return
 
-    # Pick largest video file
     files = info.files()
     preferred = ['.mp4', '.webm', '.mkv', '.avi', '.mov']
     target = None
@@ -284,7 +275,6 @@ def start_download(torrent_url, movie_id):
         priorities[target] = 7
         handle.prioritize_files(priorities)
 
-        # Head + tail pieces priority (moov atom often at end)
         file_offset = files.file_offset(target)
         file_size = files.file_size(target)
         piece_len = info.piece_length()

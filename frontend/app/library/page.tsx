@@ -15,6 +15,9 @@ interface Movie {
   casting?: any
 }
 
+type SortKey = 'title' | 'year' | 'rating'
+type SortOrder = 'asc' | 'desc'
+
 export default function LibraryPage() {
   const ready = useAuth()
   const router = useRouter()
@@ -25,6 +28,8 @@ export default function LibraryPage() {
   const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(false)
   const [hasMore, setHasMore] = useState(true)
+  const [sortKey, setSortKey] = useState<SortKey>('title')
+  const [sortOrder, setSortOrder] = useState<SortOrder>('asc')
   const fetchingRef = useRef(false)
 
   const fetchMovies = useCallback(async (pageNum: number, reset: boolean) => {
@@ -50,17 +55,14 @@ export default function LibraryPage() {
     }
   }, [query, minYear, minRating, router])
 
-  // Initial load
   useEffect(() => {
     if (ready) fetchMovies(1, true)
   }, [ready])
 
-  // Setup observer ONCE when ready, callback uses refs
   const observerRef = useRef<IntersectionObserver | null>(null)
   const bottomRef = useCallback((node: HTMLDivElement | null) => {
     if (observerRef.current) observerRef.current.disconnect()
     if (!node || !hasMore) return
-
     observerRef.current = new IntersectionObserver(entries => {
       if (entries[0].isIntersecting && !fetchingRef.current && hasMore) {
         setPage(p => {
@@ -93,11 +95,45 @@ export default function LibraryPage() {
     router.push(`/movie?${q}`)
   }
 
+  function toggleSort(key: SortKey) {
+    if (sortKey === key) {
+      setSortOrder(o => o === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortKey(key)
+      setSortOrder('asc')
+    }
+  }
+
+  const sorted = [...movies].sort((a, b) => {
+    let cmp = 0
+    if (sortKey === 'title') {
+      cmp = (a.title || '').localeCompare(b.title || '')
+    } else if (sortKey === 'year') {
+      cmp = (a.year || 0) - (b.year || 0)
+    } else if (sortKey === 'rating') {
+      cmp = (a.rating || 0) - (b.rating || 0)
+    }
+    return sortOrder === 'asc' ? cmp : -cmp
+  })
+
+  function SortBtn({ k, label }: { k: SortKey, label: string }) {
+    const active = sortKey === k
+    return (
+      <button
+        onClick={() => toggleSort(k)}
+        className="btn"
+        style={{ opacity: active ? 1 : 0.5, fontSize: '0.8rem', padding: '4px 10px' }}
+      >
+        {label} {active ? (sortOrder === 'asc' ? '↑' : '↓') : ''}
+      </button>
+    )
+  }
+
   if (!ready) return <p className="p-8 muted">Loading...</p>
 
   return (
     <div className="p-6 max-w-6xl mx-auto">
-      <form onSubmit={handleSearch} className="flex flex-wrap gap-2 mb-8 items-center">
+      <form onSubmit={handleSearch} className="flex flex-wrap gap-2 mb-4 items-center">
         <input className="input flex-1 min-w-[200px]" placeholder="Search a movie..."
           value={query} onChange={e => setQuery(e.target.value)} />
         <input type="number" placeholder="Min year" className="input w-28"
@@ -108,13 +144,28 @@ export default function LibraryPage() {
         {loading && <div className="spinner" />}
       </form>
 
+      <div className="flex gap-2 mb-6 items-center">
+        <span className="muted text-sm">Sort:</span>
+        <SortBtn k="title" label="Name" />
+        <SortBtn k="year" label="Year" />
+        <SortBtn k="rating" label="Rating" />
+      </div>
+
       <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-5">
-        {movies.map((m, i) => (
+        {sorted.map((m, i) => (
           <div key={i} onClick={() => openMovie(m)}
             className={`card cursor-pointer overflow-hidden ${m.watched ? 'opacity-50' : ''}`}>
             <div className="flex items-center justify-center" style={{ height: '220px', background: '#ece7dc' }}>
               {m.cover
-                ? <img src={m.cover} alt={m.title} className="max-h-full max-w-full object-contain" />
+                ? <img src={m.cover} alt={m.title} className="max-h-full max-w-full object-contain"
+                    onError={(e) => {
+                      const img = e.target as HTMLImageElement
+                      img.style.display = 'none'
+                      const fallback = document.createElement('span')
+                      fallback.className = 'muted text-sm'
+                      fallback.textContent = 'No cover'
+                      img.parentElement?.appendChild(fallback)
+                    }} />
                 : <span className="muted text-sm">No cover</span>}
             </div>
             <div className="p-3">

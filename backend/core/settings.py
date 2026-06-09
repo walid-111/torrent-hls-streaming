@@ -1,6 +1,7 @@
 from pathlib import Path
 import os
 from dotenv import load_dotenv
+from corsheaders.defaults import default_headers
 
 load_dotenv()
 
@@ -35,9 +36,8 @@ MIDDLEWARE = [
 CORS_ALLOWED_ORIGINS = ['http://localhost:3000']
 CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_HEADERS = [
-    'accept', 'accept-encoding', 'authorization',
-    'content-type', 'dnt', 'origin', 'user-agent',
-    'x-csrftoken', 'x-requested-with', 'range',
+    *default_headers,
+    'range',
 ]
 SESSION_COOKIE_SAMESITE = 'Lax'
 SESSION_COOKIE_SECURE = False

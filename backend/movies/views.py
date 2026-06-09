@@ -1,7 +1,9 @@
 import os
+import re
 import time
+import mimetypes
 import subprocess
-from django.http import StreamingHttpResponse
+from django.http import HttpResponse, StreamingHttpResponse
 from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -10,17 +12,132 @@ from .models import Movie, Comment
 from .services import search_all, start_download, get_playable_file, get_subtitle_text
 
 
+BUFF_SIZE = 10 * 1024 * 1024
+
+
 def _file_is_playable(filepath):
-    """ffprobe must successfully read the file. Means moov atom is present."""
     try:
         r = subprocess.run(
-            ['ffprobe', '-v', 'error',
-             '-show_entries', 'stream=codec_name',
+            ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_name',
              '-of', 'csv=p=0', filepath],
             capture_output=True, timeout=10
         )
         return r.returncode == 0 and bool(r.stdout.strip())
     except Exception:
+        return False
+
+
+def _get_range(request):
+    range_header = request.META.get('HTTP_RANGE', '')
+    m = re.match(r'bytes=(?P<start>\d+)-(?P<end>\d+)?', range_header)
+    if m:
+        start = int(m.group('start'))
+        end = int(m.group('end')) if m.group('end') else None
+        return start, end
+    return 0, None
+
+
+def _stream_ffmpeg(filepath):
+    cmd = [
+        'ffmpeg', '-re',
+        '-i', filepath,
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+        '-c:a', 'aac', '-ac', '2', '-b:a', '128k',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        '-frag_duration', '2000000',
+        '-f', 'mp4', '-loglevel', 'error',
+        'pipe:1',
+    ]
+    process = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
+    )
+
+    buffered = bytearray()
+    deadline = time.time() + 30
+    found_ftyp = False
+
+    while time.time() < deadline:
+        chunk = process.stdout.read(4096)
+        if not chunk:
+            if process.poll() is not None:
+                err = process.stderr.read().decode('utf-8', errors='replace')
+                print(f"ffmpeg pipe died: {err}", flush=True)
+                break
+            time.sleep(0.05)
+            continue
+        buffered.extend(chunk)
+
+        if not found_ftyp and len(buffered) >= 8:
+            if b'ftyp' in buffered[:16]:
+                found_ftyp = True
+
+        if found_ftyp and len(buffered) >= 65536:
+            break
+
+    if not found_ftyp or len(buffered) < 1024:
+        try: process.kill()
+        except: pass
+        return Response({'error': 'Stream not ready'}, status=503)
+
+    def stream():
+        try:
+            yield bytes(buffered)
+            while True:
+                chunk = process.stdout.read(65536)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try: process.kill()
+            except: pass
+
+    resp = StreamingHttpResponse(stream(), content_type='video/mp4')
+    resp['Accept-Ranges'] = 'none'
+    resp['Cache-Control'] = 'no-cache'
+    resp['X-Content-Type-Options'] = 'nosniff'
+    return resp
+
+
+def _serve_file(filepath, start, end=None):
+    file_size_on_disk = os.path.getsize(filepath)
+
+    if start >= file_size_on_disk:
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            file_size_on_disk = os.path.getsize(filepath)
+            if start < file_size_on_disk:
+                break
+            time.sleep(1)
+        else:
+            start = 0
+            file_size_on_disk = os.path.getsize(filepath)
+
+    if end is None:
+        end = start + BUFF_SIZE - 1
+    end = min(end, file_size_on_disk - 1, start + BUFF_SIZE - 1)
+    length = end - start + 1
+
+    with open(filepath, 'rb') as f:
+        f.seek(start)
+        data = f.read(length)
+
+    resp = HttpResponse(data, status=206, content_type=mimetypes.guess_type(filepath)[0] or 'video/mp4')
+    resp['Content-Range'] = f'bytes {start}-{end}/{file_size_on_disk}'
+    resp['Accept-Ranges'] = 'bytes'
+    resp['Content-Length'] = str(length)
+    return resp
+
+def _is_h264(filepath):
+    try:
+        r = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
+             '-show_entries', 'stream=codec_name',
+             '-of', 'csv=p=0', filepath],
+            capture_output=True, timeout=10
+        )
+        codec = r.stdout.decode().strip().lower()
+        return codec in ('h264', 'hevc', 'h265', 'vp8', 'vp9', 'av1')
+    except:
         return False
 
 
@@ -73,103 +190,27 @@ def stream_video(request, movie_id):
         return Response({'error': 'Stream not ready'}, status=503)
 
     ext = os.path.splitext(filepath)[1].lower()
-    needs_transcode = ext in ('.mkv', '.avi', '.mov', '.mpeg', '.mpg')
-
-    if needs_transcode:
+    if ext in ('.mkv', '.avi', '.mov', '.mpeg', '.mpg') or not _is_h264(filepath):
         return _stream_ffmpeg(filepath)
-    else:
-        return _stream_file(request, filepath)
+
+    start, end = _get_range(request)
+    return _serve_file(filepath, start, end)
 
 
-def _stream_file(request, filepath):
-    """Serve file directly with Range support — seek + duration work perfectly."""
-    size = os.path.getsize(filepath)
-    ext = os.path.splitext(filepath)[1].lower()
-    content_type = 'video/mp4' if ext == '.mp4' else 'video/webm' if ext == '.webm' else 'video/mp4'
-
-    range_header = request.META.get('HTTP_RANGE', '')
-    if range_header:
-        # Parse Range: bytes=start-end
-        try:
-            range_val = range_header.strip().replace('bytes=', '')
-            parts = range_val.split('-')
-            start = int(parts[0]) if parts[0] else 0
-            end = int(parts[1]) if parts[1] else size - 1
-        except:
-            start, end = 0, size - 1
-    else:
-        start, end = 0, size - 1
-
-    end = min(end, size - 1)
-    length = end - start + 1
-    chunk_size = 1024 * 1024  # 1MB chunks
-
-    def file_iterator():
-        with open(filepath, 'rb') as f:
-            f.seek(start)
-            remaining = length
-            while remaining > 0:
-                read_size = min(chunk_size, remaining)
-                data = f.read(read_size)
-                if not data:
-                    break
-                yield data
-                remaining -= len(data)
-
-    status = 206 if range_header else 200
-    resp = StreamingHttpResponse(file_iterator(), status=status, content_type=content_type)
-    resp['Content-Length'] = str(length)
-    resp['Content-Range'] = f'bytes {start}-{end}/{size}'
-    resp['Accept-Ranges'] = 'bytes'
-    resp['Cache-Control'] = 'no-cache'
-    return resp
-
-
-def _stream_ffmpeg(filepath):
-    """For non-browser-native formats (mkv, avi...), transcode on the fly."""
-    cmd = [
-        'ffmpeg', '-i', filepath,
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
-        '-c:a', 'aac', '-ac', '2', '-b:a', '128k',
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-        '-frag_duration', '500000',
-        '-f', 'mp4', '-loglevel', 'error', 'pipe:1',
-    ]
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
-
-    buffered = bytearray()
-    deadline = time.time() + 15
-    while len(buffered) < 256 * 1024 and time.time() < deadline:
-        chunk = process.stdout.read(65536)
-        if not chunk:
-            if process.poll() is not None:
-                break
-            time.sleep(0.1)
-            continue
-        buffered.extend(chunk)
-
-    if len(buffered) < 1024:
-        try: process.kill()
-        except: pass
-        return Response({'error': 'Stream not ready'}, status=503)
-
-    def stream():
-        try:
-            yield bytes(buffered)
-            while True:
-                chunk = process.stdout.read(65536)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            try: process.kill()
-            except: pass
-
-    resp = StreamingHttpResponse(stream(), content_type='video/mp4')
-    resp['Accept-Ranges'] = 'none'
-    resp['Cache-Control'] = 'no-cache'
-    resp['X-Content-Type-Options'] = 'nosniff'
-    return resp
+def _ffmpeg_can_stream(filepath):
+    try:
+        r = subprocess.run(
+            [
+                'ffmpeg', '-v', 'error',
+                '-i', filepath,
+                '-frames:v', '1',
+                '-f', 'null', '-'
+            ],
+            capture_output=True, timeout=15
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 @api_view(['GET'])
@@ -188,9 +229,16 @@ def movie_status(request, movie_id):
         if f and os.path.exists(f):
             filepath = f
 
-    if filepath and _file_is_playable(filepath):
-        return Response({'ready': True})
-    return Response({'ready': False})
+    if not filepath or not _file_is_playable(filepath):
+        return Response({'ready': False})
+
+    if os.path.getsize(filepath) < 50 * 1024 * 1024:
+        return Response({'ready': False})
+
+    if not _ffmpeg_can_stream(filepath):
+        return Response({'ready': False})
+
+    return Response({'ready': True})
 
 
 @api_view(['GET'])

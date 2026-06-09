@@ -1,5 +1,5 @@
 # TEST PLAIN TEXT PASSWORD IN DB
-docker compose exec db psql -U $POSTGRES_USER -d $POSTGRES_DB
+docker compose exec db psql -U hypertube_user -d hypertube
 SELECT username, password FROM users_user;
 
 # TEST FORM VALIDATION SHORT PASSWORD

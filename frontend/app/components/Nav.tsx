@@ -8,8 +8,6 @@ export default function Nav() {
   const [loggedIn, setLoggedIn] = useState(false)
 
   useEffect(() => {
-    // check API for session cookie
-    if (!document.cookie.includes('sessionid')) return
     fetch('http://localhost:8000/api/profile/', { credentials: 'include' })
       .then(res => setLoggedIn(res.ok))
   }, [])

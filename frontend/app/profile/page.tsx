@@ -73,12 +73,14 @@ export default function ProfilePage() {
       {error && <p className="text-red-600 mb-3 text-sm">{error}</p>}
       <form onSubmit={handleSubmit} className="flex flex-col gap-3" noValidate>
         <div className="flex flex-col items-center gap-3">
-          <img
-            src={preview || (user.avatar ? `http://localhost:8000${user.avatar}` : '')}
-            className="w-24 h-24 rounded-full object-cover"
-            style={{ background: '#ece7dc' }}
-            alt=""
-          />
+          {(preview || user.avatar) && (
+            <img
+              src={preview || `http://localhost:8000${user.avatar}`}
+              className="w-24 h-24 rounded-full object-cover"
+              style={{ background: '#ece7dc' }}
+              alt=""
+            />
+          )}
           <label className="btn cursor-pointer text-sm">
             Choose photo
             <input type="file" accept="image/*" className="hidden" onChange={handleFile} />

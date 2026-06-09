@@ -108,14 +108,25 @@ def auth_42_callback(request):
         headers={'Authorization': f'Bearer {token}'}
     ).json()
 
-    user, _ = User.objects.get_or_create(
-        username=user_data['login'],
-        defaults={
-            'email': user_data.get('email', ''),
-            'first_name': user_data.get('first_name', ''),
-            'last_name': user_data.get('last_name', ''),
-        }
-    )
+    fortytwo_id = str(user_data['id'])
+
+    user = User.objects.filter(fortytwo_id=fortytwo_id).first()
+    if not user:
+        base = user_data['login']
+        username = base
+        counter = 1
+        while User.objects.filter(username=username).exists():
+            username = f"{base}_{counter}"
+            counter += 1
+
+        user = User.objects.create(
+            username=username,
+            fortytwo_id=fortytwo_id,
+            email=user_data.get('email', ''),
+            first_name=user_data.get('first_name', ''),
+            last_name=user_data.get('last_name', ''),
+        )
+
     login(request, user)
     return redirect(f'{FRONTEND}/library')
 
@@ -157,16 +168,28 @@ def auth_github_callback(request):
         headers={'Authorization': f'Bearer {token}'}
     ).json()
 
-    email = user_data.get('email') or f"{user_data['login']}@github.local"
-    name_parts = (user_data.get('name') or user_data['login']).split(' ', 1)
-    user, _ = User.objects.get_or_create(
-        username=f"gh_{user_data['login']}",
-        defaults={
-            'email': email,
-            'first_name': name_parts[0],
-            'last_name': name_parts[1] if len(name_parts) > 1 else '',
-        }
-    )
+    github_id = str(user_data['id'])
+
+    user = User.objects.filter(github_id=github_id).first()
+    if not user:
+        email = user_data.get('email') or f"{user_data['login']}@github.local"
+        name_parts = (user_data.get('name') or user_data['login']).split(' ', 1)
+
+        base = f"gh_{user_data['login']}"
+        username = base
+        counter = 1
+        while User.objects.filter(username=username).exists():
+            username = f"{base}_{counter}"
+            counter += 1
+
+        user = User.objects.create(
+            username=username,
+            github_id=github_id,
+            email=email,
+            first_name=name_parts[0],
+            last_name=name_parts[1] if len(name_parts) > 1 else '',
+        )
+
     login(request, user)
     return redirect(f'{FRONTEND}/library')
 

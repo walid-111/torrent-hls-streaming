@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, Suspense } from 'react'
+import { useState, useEffect, useRef, Suspense } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
 
 function MovieContent() {
@@ -18,19 +18,19 @@ function MovieContent() {
   try { casting = JSON.parse(params.get('casting') || 'null') } catch {}
 
   const [movieId, setMovieId] = useState<number | null>(null)
-  const [ready, setReady] = useState(false)
-  const [buffering, setBuffering] = useState(false)
-  const [videoKey, setVideoKey] = useState(0)
+  const [status, setStatus] = useState<string>('downloading')
   const [comments, setComments] = useState<any[]>([])
   const [comment, setComment] = useState('')
   const [subtitles, setSubtitles] = useState<any[]>([])
+  const startedRef = useRef(false)
 
   function getCsrf() {
     return document.cookie.split('; ').find(r => r.startsWith('csrftoken='))?.split('=')[1] || ''
   }
 
   useEffect(() => {
-    if (!magnet) return
+    if (!magnet || startedRef.current) return
+    startedRef.current = true
     fetch('http://localhost:8000/api/movies/start/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCsrf() },
@@ -48,24 +48,24 @@ function MovieContent() {
   }, [magnet])
 
   useEffect(() => {
-    if (!movieId || ready) return
+    if (!movieId || status === 'ready' || status === 'unsupported') return
     const interval = setInterval(() => {
       fetch(`http://localhost:8000/api/movies/status/${movieId}/`, { credentials: 'include' })
         .then(res => res.json())
         .then(data => {
-          if (data.ready) {
-            setReady(true)
+          if (data.status) setStatus(data.status)
+          if (data.status === 'ready' || data.status === 'unsupported') {
             clearInterval(interval)
           }
         })
+        .catch(() => {})
     }, 2000)
     return () => clearInterval(interval)
-  }, [movieId, ready])
+  }, [movieId, status])
 
   function loadComments(id: number) {
     fetch(`http://localhost:8000/api/movies/${id}/comments/`, { credentials: 'include' })
-      .then(res => res.json())
-      .then(setComments)
+      .then(res => res.json()).then(setComments).catch(() => {})
   }
 
   function loadSubtitles(id: number) {
@@ -78,16 +78,7 @@ function MovieContent() {
         })
         setSubtitles(list)
       })
-  }
-
-  // If playback catches up to the download, the stream cuts off.
-  // Show a buffering loader and reload the player after a short wait.
-  function handleVideoError() {
-    setBuffering(true)
-    setTimeout(() => {
-      setBuffering(false)
-      setVideoKey(k => k + 1)
-    }, 4000)
+      .catch(() => {})
   }
 
   async function postComment(e: React.SyntheticEvent) {
@@ -132,21 +123,29 @@ function MovieContent() {
         </div>
       </div>
 
-      {(!ready || buffering) && movieId && (
+      {movieId && status === 'downloading' && (
         <div className="card p-12 text-center mb-6 flex flex-col items-center gap-4">
           <div className="spinner" />
-          <p className="muted">
-            {buffering ? 'Buffering, please wait...' : 'Preparing video, download in progress...'}
+          <p className="muted">Preparing video, download in progress...</p>
+        </div>
+      )}
+
+      {movieId && status === 'unsupported' && (
+        <div className="card p-12 text-center mb-6">
+          <p className="text-red-600 font-semibold mb-2">Unsupported video format</p>
+          <p className="muted text-sm">
+            This video uses a codec or container that cannot be played in the browser.
+            Only mp4, webm, and mkv files are supported.
           </p>
         </div>
       )}
 
-      {ready && !buffering && movieId && (
-        <video key={videoKey} className="w-full rounded mb-6 card" controls onError={handleVideoError}>
-          <source src={`http://localhost:8000/api/movies/stream/${movieId}/`} />
+      {movieId && status === 'ready' && (
+        <video key={movieId} className="w-full rounded mb-6 card" controls preload="metadata">
+          <source src={`http://localhost:8000/api/movies/stream/${movieId}/`} type="video/mp4" />
           {subtitles.map((s, i) => (
             <track key={i} kind="subtitles" src={s.url} srcLang={s.lang}
-              label={s.lang === 'en' ? 'English' : s.lang} />
+              label={s.lang === 'en' ? 'English' : s.lang} default={s.lang === 'en'} />
           ))}
         </video>
       )}

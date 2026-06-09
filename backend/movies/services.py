@@ -217,9 +217,25 @@ def start_download(torrent_url, movie_id):
             break
 
     if target is not None:
-        priorities = [0] * info.num_files()
-        priorities[target] = 7
-        handle.prioritize_files(priorities)
+            priorities = [0] * info.num_files()
+            priorities[target] = 7
+            handle.prioritize_files(priorities)
+
+            # Prioritize the head AND tail pieces of the target file.
+            # Many mp4s have the moov atom (the index ffmpeg needs) at the very END,
+            # so without this the file is unplayable until 100% download.
+            fs = info.files()
+            file_offset = fs.file_offset(target)
+            file_size = fs.file_size(target)
+            piece_len = info.piece_length()
+
+            first_piece = file_offset // piece_len
+            last_piece = (file_offset + file_size - 1) // piece_len
+
+            for p in range(first_piece, min(first_piece + 5, last_piece + 1)):
+                handle.piece_priority(p, 7)
+            for p in range(max(last_piece - 9, first_piece), last_piece + 1):
+                handle.piece_priority(p, 7)
 
     active_downloads[torrent_url] = handle
     Movie.objects.filter(id=movie_id).update(folder=info.name())

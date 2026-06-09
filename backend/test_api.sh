@@ -27,14 +27,14 @@ A="Authorization: Bearer $TOKEN"
 expect "Wrong credentials → 401" 401 "$(curl -si -X POST "$API/oauth/token/" \
   -H "Content-Type: application/json" -d '{"username":"fake","password":"wrong"}')"
 
-# ── USERS (route API officielle: /api/users/) ──
+# ── USERS ──
 echo -e "\n── 2) USERS ──"
-expect "GET /api/users no auth → 401"     401 "$(curl -si "$API/api/users/")"
-expect "GET /api/users auth → 200"        200 "$(curl -si "$API/api/users/" -H "$A")"
-expect "GET /api/users/$MY_USER_ID own → 200"        200 "$(curl -si "$API/api/users/$MY_USER_ID/" -H "$A")"
-expect "GET /api/users/$OTHER_USER_ID other → 200"   200 "$(curl -si "$API/api/users/$OTHER_USER_ID/" -H "$A")"
-expect "GET /api/users/999 → 404"         404 "$(curl -si "$API/api/users/999/" -H "$A")"
-expect "PATCH /api/users/$MY_USER_ID own → 200"      200 "$(curl -si -X PATCH "$API/api/users/$MY_USER_ID/" \
+expect "GET /api/users no auth → 401"      401 "$(curl -si "$API/api/users/")"
+expect "GET /api/users auth → 200"         200 "$(curl -si "$API/api/users/" -H "$A")"
+expect "GET /api/users/$MY_USER_ID own → 200"      200 "$(curl -si "$API/api/users/$MY_USER_ID/" -H "$A")"
+expect "GET /api/users/$OTHER_USER_ID other → 200" 200 "$(curl -si "$API/api/users/$OTHER_USER_ID/" -H "$A")"
+expect "GET /api/users/999 → 404"          404 "$(curl -si "$API/api/users/999/" -H "$A")"
+expect "PATCH /api/users/$MY_USER_ID own → 200"    200 "$(curl -si -X PATCH "$API/api/users/$MY_USER_ID/" \
   -H "$A" -H "Content-Type: application/json" -d '{"username":"wbekkal"}')"
 expect "PATCH /api/users/$OTHER_USER_ID other → 403" 403 "$(curl -si -X PATCH "$API/api/users/$OTHER_USER_ID/" \
   -H "$A" -H "Content-Type: application/json" -d '{"username":"hacker"}')"
@@ -49,8 +49,8 @@ curl -s "$API/api/users/$MY_USER_ID/" -H "$A" | grep -q '"email"' \
 
 # ── MOVIES ──
 echo -e "\n── 3) MOVIES ──"
-expect "GET /api/movies no auth → 200"   200 "$(curl -si "$API/api/movies/")"
-expect "GET /api/movies auth → 200"      200 "$(curl -si "$API/api/movies/" -H "$A")"
+expect "GET /api/movies no auth → 200"    200 "$(curl -si "$API/api/movies/")"
+expect "GET /api/movies auth → 200"       200 "$(curl -si "$API/api/movies/" -H "$A")"
 expect "GET /api/movies/$TEST_MOVIE_ID → 200" 200 "$(curl -si "$API/api/movies/$TEST_MOVIE_ID/" -H "$A")"
 
 # ── COMMENTS ──
@@ -58,13 +58,19 @@ echo -e "\n── 4) COMMENTS ──"
 expect "GET /api/comments no auth → 401"  401 "$(curl -si "$API/api/comments/")"
 expect "GET /api/comments auth → 200"     200 "$(curl -si "$API/api/comments/" -H "$A")"
 
-CID=$(curl -s -X POST "$API/api/comments/" -H "$A" -H "Content-Type: application/json" \
-  -d "{\"movie_id\":$TEST_MOVIE_ID,\"content\":\"test\"}" \
-  | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
-expect "POST /api/comments → 201"        201 "$(curl -si -X POST "$API/api/comments/" \
+# POST /api/comments doit maintenant être non utilisable → 405
+expect "POST /api/comments not allowed → 405" 405 "$(curl -si -X POST "$API/api/comments/" \
   -H "$A" -H "Content-Type: application/json" -d "{\"movie_id\":$TEST_MOVIE_ID,\"content\":\"x\"}")"
+
+# Création d'un commentaire via /api/movies/:id/comments
+CID=$(curl -s -X POST "$API/api/movies/$TEST_MOVIE_ID/comments/" \
+  -H "$A" -H "Content-Type: application/json" \
+  -d '{"content":"via movie route"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+
 expect "POST /api/movies/:id/comments → 201" 201 "$(curl -si -X POST "$API/api/movies/$TEST_MOVIE_ID/comments/" \
-  -H "$A" -H "Content-Type: application/json" -d '{"content":"via movie route"}')"
+  -H "$A" -H "Content-Type: application/json" -d '{"content":"another comment"}')"
+
 expect "GET /api/comments/$CID → 200"    200 "$(curl -si "$API/api/comments/$CID/" -H "$A")"
 expect "PATCH /api/comments/$CID → 200"  200 "$(curl -si -X PATCH "$API/api/comments/$CID/" \
   -H "$A" -H "Content-Type: application/json" -d '{"content":"edited"}')"
@@ -72,11 +78,11 @@ expect "DELETE /api/comments/$CID → 204" 204 "$(curl -si -X DELETE "$API/api/c
 
 # ── UNKNOWN /api/ → 404 ──
 echo -e "\n── 5) UNKNOWN ROUTES → 404 ──"
-expect "GET /api/does-not-exist → 404"        404 "$(curl -si "$API/api/does-not-exist/" -H "$A")"
-expect "GET /api/movies/search → 404"         404 "$(curl -si "$API/api/movies/search/" -H "$A")"
-expect "GET /api/register → 404"              404 "$(curl -si "$API/api/register/" -H "$A")"
+expect "GET /api/does-not-exist → 404"   404 "$(curl -si "$API/api/does-not-exist/" -H "$A")"
+expect "GET /api/movies/search → 404"    404 "$(curl -si "$API/api/movies/search/" -H "$A")"
+expect "GET /api/register → 404"         404 "$(curl -si "$API/api/register/" -H "$A")"
 
-# ── INTERNAL ROUTES (frontend only) ──
+# ── INTERNAL ROUTES ──
 echo -e "\n── 6) INTERNAL ROUTES ──"
 expect "GET /internal/movies/search no auth → 401" 401 "$(curl -si "$API/internal/movies/search/?q=test")"
 

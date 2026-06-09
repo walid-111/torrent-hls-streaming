@@ -1,5 +1,5 @@
 'use client'
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuth } from '../components/useAuth'
 
@@ -25,9 +25,11 @@ export default function LibraryPage() {
   const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(false)
   const [hasMore, setHasMore] = useState(true)
-  const bottomRef = useRef<HTMLDivElement>(null)
+  const fetchingRef = useRef(false)
 
-  async function fetchMovies(pageNum: number, reset: boolean, signal?: AbortSignal) {
+  const fetchMovies = useCallback(async (pageNum: number, reset: boolean) => {
+    if (fetchingRef.current) return
+    fetchingRef.current = true
     setLoading(true)
     const params = new URLSearchParams({ q: query, page: String(pageNum) })
     if (minYear) params.append('min_year', minYear)
@@ -35,45 +37,46 @@ export default function LibraryPage() {
     try {
       const res = await fetch(`http://localhost:8000/internal/movies/search/?${params}`, {
         credentials: 'include',
-        signal,
       })
       if (res.status === 401 || res.status === 403) { router.push('/login'); return }
       const data = await res.json()
       const list = Array.isArray(data) ? data : []
       setMovies(prev => reset ? list : [...prev, ...list])
       setHasMore(list.length > 0)
-    } catch (err: any) {
-      if (signal?.aborted) return
-    } finally {
+      if (reset) setPage(1)
+    } catch {} finally {
       setLoading(false)
+      fetchingRef.current = false
     }
-  }
+  }, [query, minYear, minRating, router])
 
+  // Initial load
   useEffect(() => {
-    if (!ready) return
-    const controller = new AbortController()
-    fetchMovies(1, true, controller.signal).catch(() => {})
-    return () => controller.abort()
+    if (ready) fetchMovies(1, true)
   }, [ready])
 
-  useEffect(() => {
-    const controller = new AbortController()
-    const observer = new IntersectionObserver(entries => {
-      if (entries[0].isIntersecting && hasMore && !loading) {
-        const next = page + 1
-        setPage(next)
-        fetchMovies(next, false, controller.signal).catch(() => {})
+  // Setup observer ONCE when ready, callback uses refs
+  const observerRef = useRef<IntersectionObserver | null>(null)
+  const bottomRef = useCallback((node: HTMLDivElement | null) => {
+    if (observerRef.current) observerRef.current.disconnect()
+    if (!node || !hasMore) return
+
+    observerRef.current = new IntersectionObserver(entries => {
+      if (entries[0].isIntersecting && !fetchingRef.current && hasMore) {
+        setPage(p => {
+          const next = p + 1
+          fetchMovies(next, false)
+          return next
+        })
       }
-    })
-    if (bottomRef.current) observer.observe(bottomRef.current)
-    return () => { observer.disconnect(); controller.abort() }
-  }, [page, hasMore, loading])
+    }, { rootMargin: '200px' })
+    observerRef.current.observe(node)
+  }, [hasMore, fetchMovies])
 
   function handleSearch(e: React.SyntheticEvent) {
     e.preventDefault()
-    setPage(1)
     setHasMore(true)
-    fetchMovies(1, true).catch(() => {})
+    fetchMovies(1, true)
   }
 
   function openMovie(m: Movie) {
@@ -126,7 +129,7 @@ export default function LibraryPage() {
       {loading && movies.length > 0 && (
         <div className="flex justify-center py-6"><div className="spinner" /></div>
       )}
-      <div ref={bottomRef} className="h-10" />
+      {hasMore && <div ref={bottomRef} className="h-10" />}
     </div>
   )
 }

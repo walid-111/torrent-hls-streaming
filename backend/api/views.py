@@ -79,33 +79,16 @@ def movie_detail(request, pk):
     })
 
 
-@api_view(['GET', 'POST'])
+@api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def comments_list(request):
-    if request.method == 'GET':
-        comments = Comment.objects.order_by('-created_at')[:20]
-        return Response([{
-            'id': c.id,
-            'author': c.author.username,
-            'content': c.content,
-            'created_at': c.created_at,
-        } for c in comments])
-
-    movie_id = request.data.get('movie_id')
-    content = request.data.get('content')
-    if not movie_id or not content:
-        return Response({'error': 'movie_id and content required'}, status=400)
-    try:
-        movie = Movie.objects.get(pk=movie_id)
-    except Movie.DoesNotExist:
-        return Response({'error': 'Movie not found'}, status=404)
-    comment = Comment.objects.create(movie=movie, author=request.user, content=content)
-    return Response({
-        'id': comment.id,
-        'author': comment.author.username,
-        'content': comment.content,
-        'created_at': comment.created_at,
-    }, status=201)
+    comments = Comment.objects.order_by('-created_at')[:20]
+    return Response([{
+        'id': c.id,
+        'author': c.author.username,
+        'content': c.content,
+        'created_at': c.created_at,
+    } for c in comments])
 
 
 @api_view(['GET', 'PATCH', 'DELETE'])

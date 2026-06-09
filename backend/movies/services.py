@@ -83,61 +83,72 @@ def search_archive(query, page=1, min_year=None, min_rating=None):
     return results
 
 
-def search_publicdomain(query):
-    base = "https://www.publicdomaintorrents.info"
-    cats = ['scifi', 'horror', 'action', 'comedy', 'drama', 'westerns']
-    results = []
-    seen = set()
+def search_yts(query, page=1, min_year=None, min_rating=None):
+    params = {
+        'limit': 20,
+        'page': page,
+        'sort_by': 'download_count' if not query else 'title',
+        'order_by': 'desc',
+    }
+    if query:
+        params['query_term'] = query
+    if min_rating:
+        params['minimum_rating'] = int(float(min_rating))
 
-    for cat in cats:
-        try:
-            r = requests.get(f"{base}/nshowcat.html?category={cat}", timeout=8)
-            soup = BeautifulSoup(r.text, 'html.parser')
-        except:
+    try:
+        r = requests.get('https://yts.mx/api/v2/list_movies.json', params=params, timeout=10)
+        data = r.json().get('data', {})
+        movies = data.get('movies', []) or []
+    except Exception:
+        return []
+
+    results = []
+    for m in movies:
+        year = m.get('year')
+        if min_year and year and int(year) < int(min_year):
             continue
 
-        for link in soup.select('a[href*="nshowmovie.html?movieid="]'):
-            title = link.get_text(strip=True)
-            if not title or title.lower() in seen:
-                continue
-            if query and query.lower() not in title.lower():
-                continue
-            seen.add(title.lower())
+        # Pick best torrent (prefer 1080p, fallback to 720p, then anything)
+        torrents = m.get('torrents', []) or []
+        chosen = None
+        for q in ('1080p', '720p'):
+            chosen = next((t for t in torrents if t.get('quality') == q), None)
+            if chosen:
+                break
+        if not chosen and torrents:
+            chosen = torrents[0]
+        if not chosen:
+            continue
 
-            movie_url = base + '/' + link['href'].lstrip('/')
-            try:
-                page = BeautifulSoup(requests.get(movie_url, timeout=8).text, 'html.parser')
-            except:
-                continue
+        # YTS gives a torrent .torrent URL via "url" field
+        torrent_url = chosen.get('url')
+        if not torrent_url:
+            continue
 
-            torrent = None
-            for a in page.select('a[href*="btdownload.php"]'):
-                if '.mp4.torrent' in a['href'].lower():
-                    torrent = a['href']
-                    break
-            if not torrent:
-                continue
+        casting = {
+            'director': None,
+            'producer': None,
+            'cast': [c.get('name') for c in (m.get('cast') or [])[:5] if c.get('name')],
+        }
 
-            rating, casting = _tmdb(title)
-            results.append({
-                'title': title,
-                'magnet': torrent,
-                'cover': '',
-                'year': None,
-                'rating': rating,
-                'summary': '',
-                'casting': casting,
-                'source': 'publicdomaintorrents',
-            })
-            if len(results) >= 12:
-                return results
+        results.append({
+            'title': m.get('title', ''),
+            'magnet': torrent_url,
+            'cover': m.get('large_cover_image') or m.get('medium_cover_image') or '',
+            'year': year,
+            'rating': m.get('rating'),
+            'summary': m.get('summary') or m.get('description_full') or '',
+            'casting': casting,
+            'source': 'yts',
+        })
     return results
 
 
 def search_all(query, page=1, min_year=None, min_rating=None):
+    if page > 20:
+        return []
     results = search_archive(query, page, min_year, min_rating)
-    if page == 1 and query:
-        results += search_publicdomain(query)
+    results += search_yts(query, page, min_year, min_rating)
     if query:
         results.sort(key=lambda r: r['title'].lower())
     return results
@@ -203,7 +214,7 @@ def start_download(torrent_url, movie_id):
     })
     # Sequential download: pieces arrive in order, from start to end,
     # so ffmpeg can read the file progressively as it grows.
-    handle.set_sequential_download(True)
+    # handle.set_sequential_download(True)
 
     files = info.files()
     preferred = ['.mp4', '.webm', '.mkv', '.avi', '.mov', '.mpeg', '.mpg']

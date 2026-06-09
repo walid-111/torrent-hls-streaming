@@ -83,45 +83,101 @@ def search_archive(query, page=1, min_year=None, min_rating=None):
     return results
 
 
-def search_archive_classic(query, page=1, min_year=None, min_rating=None):
-    """Second source: archive.org's classic_tv_movies collection (different from feature_films)."""
-    if query:
-        q = f"title:({query})+AND+collection:(classic_tv_movies)"
-    else:
-        q = "collection:(classic_tv_movies)+AND+mediatype:(movies)+AND+format:(MPEG4)"
-    if min_year:
-        q += f"+AND+year:[{min_year}+TO+9999]"
+def search_publicdomain_torrents(query, page=1, min_year=None, min_rating=None):
+    """
+    Simple scraper pour PublicDomainTorrents.
+    Pas de vraie pagination côté site, donc on fait une pagination maison.
+    """
+    base = "https://www.publicdomaintorrents.info"
+    list_url = f"{base}/nshowcat.html?category=ALL"
 
-    url = (
-        f"https://archive.org/advancedsearch.php?q={q}"
-        f"&fl[]=identifier,title,year,avg_rating,description"
-        f"&sort[]=week+desc&output=json&rows=10&page={page}"
-    )
     try:
-        docs = requests.get(url, timeout=10).json().get('response', {}).get('docs', [])
-    except:
+        html = requests.get(list_url, timeout=10).text
+    except Exception:
         return []
 
+    soup = BeautifulSoup(html, 'html.parser')
+
+    # Récupère tous les liens vers nshowmovie.html
+    links = []
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        if 'nshowmovie.html' in href:
+            title = a.get_text(strip=True)
+            if not title:
+                continue
+            # Si query fournie, filtrer côté titre
+            if query and query.lower() not in title.lower():
+                continue
+            links.append({
+                'title': title,
+                'url': href if href.startswith('http') else base + '/' + href.lstrip('/'),
+            })
+
+    if not links:
+        return []
+
+    # Pagination "maison"
+    per_page = 10
+    start = (page - 1) * per_page
+    end = start + per_page
+    subset = links[start:end]
+
     results = []
-    for item in docs:
-        ident = item.get('identifier')
-        title = item.get('title', '')
-        rating = item.get('avg_rating')
-        _, casting = _tmdb(title)
-        if not rating:
-            rating, _ = _tmdb(title)
+    for item in subset:
+        detail_url = item['url']
+        title = item['title']
+
+        try:
+            detail_html = requests.get(detail_url, timeout=10).text
+        except Exception:
+            continue
+
+        detail = BeautifulSoup(detail_html, 'html.parser')
+
+        # Cherche lien .torrent
+        torrent_url = None
+        for a in detail.find_all('a', href=True):
+            href = a['href']
+            if href.lower().endswith('.torrent'):
+                torrent_url = href if href.startswith('http') else base + '/' + href.lstrip('/')
+                break
+        if not torrent_url:
+            continue
+
+        # Résumé / année très basique (le HTML du site est old-school)
+        summary = ''
+        year = None
+
+        # Exemple : souvent le synopsis est dans des <p> ou <font>
+        paras = detail.find_all('p')
+        if paras:
+            summary = paras[0].get_text(strip=True)
+
+        # Si tu veux tenter d'extraire une année du titre ou du texte :
+        if not year:
+            import re
+            m = re.search(r'\b(19\d{2}|20\d{2})\b', title)
+            if m:
+                year = m.group(1)
+
+        rating, casting = _tmdb(title)
         if min_rating and (not rating or float(rating) < float(min_rating)):
             continue
+        if min_year and year and str(year).isdigit() and int(year) < int(min_year):
+            continue
+
         results.append({
             'title': title,
-            'magnet': f"https://archive.org/download/{ident}/{ident}_archive.torrent",
-            'cover': f"https://archive.org/services/img/{ident}",
-            'year': item.get('year'),
+            'magnet': torrent_url,  # c'est une URL .torrent, pas un magnet
+            'cover': None,          # pas d'image fiable sur ce site
+            'year': year,
             'rating': rating,
-            'summary': item.get('description', ''),
+            'summary': summary,
             'casting': casting,
-            'source': 'archive.org/classic_tv',
+            'source': 'publicdomaintorrents',
         })
+
     return results
 
 
@@ -130,7 +186,8 @@ def search_all(query, page=1, min_year=None, min_rating=None):
         return []
     results = search_archive(query, page, min_year, min_rating)
     if page <= 3:
-        results += search_archive_classic(query, page, min_year, min_rating)
+        results += search_archive(query, page, min_year, min_rating)
+        results += search_publicdomain_torrents(query, page, min_year, min_rating)
     if query:
         results.sort(key=lambda r: r['title'].lower())
     return results

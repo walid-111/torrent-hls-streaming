@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-set -e
-
 API="http://localhost:8000"
 USERNAME="wbekkal"
 PASSWORD="12341234Wb!?"
@@ -8,173 +6,91 @@ MY_USER_ID=1
 OTHER_USER_ID=2
 TEST_MOVIE_ID=1
 
-function print_title() {
-  echo
-  echo "============= $1 ============="
+G="\033[32m✅" R="\033[31m❌" NC="\033[0m"
+pass=0; fail=0
+
+expect() {
+  local label=$1 expected=$2
+  local status=$(echo "$3" | grep -oE 'HTTP/[0-9.]+ [0-9]+' | tail -1 | awk '{print $2}')
+  if [ "$status" = "$expected" ]; then echo -e "$G $label$NC"; ((pass++))
+  else echo -e "$R $label → got $status, expected $expected$NC"; ((fail++)); fi
 }
 
-function expect() {
-  local label=$1
-  local expected=$2
-  local actual=$3
-  if echo "$actual" | grep -qE "HTTP/[0-9.]+ $expected"; then
-    echo "✅ $label → $expected"
-  else
-    STATUS=$(echo "$actual" | grep -oE 'HTTP/[0-9.]+ [0-9]+' | head -1 | awk '{print $2}')
-    echo "❌ $label → attendu $expected, obtenu $STATUS"
-  fi
-}
+# ── TOKEN ──
+echo -e "\n── 1) OAUTH2 TOKEN ──"
+TOKEN=$(curl -s -X POST "$API/oauth/token/" -H "Content-Type: application/json" \
+  -d "{\"username\":\"$USERNAME\",\"password\":\"$PASSWORD\"}" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin).get('access',''))")
+[ -z "$TOKEN" ] && echo -e "$R Token failed — aborting$NC" && exit 1
+echo -e "$G Token obtained$NC"; ((pass++))
+A="Authorization: Bearer $TOKEN"
+expect "Wrong credentials → 401" 401 "$(curl -si -X POST "$API/oauth/token/" \
+  -H "Content-Type: application/json" -d '{"username":"fake","password":"wrong"}')"
 
-# ========= 1) TOKEN =========
-print_title "1) Obtenir un token via /oauth/token/"
-RESPONSE=$(curl -s -X POST "$API/oauth/token/" \
+# ── USERS (route API officielle: /api/users/) ──
+echo -e "\n── 2) USERS ──"
+expect "GET /api/users no auth → 401"     401 "$(curl -si "$API/api/users/")"
+expect "GET /api/users auth → 200"        200 "$(curl -si "$API/api/users/" -H "$A")"
+expect "GET /api/users/$MY_USER_ID own → 200"        200 "$(curl -si "$API/api/users/$MY_USER_ID/" -H "$A")"
+expect "GET /api/users/$OTHER_USER_ID other → 200"   200 "$(curl -si "$API/api/users/$OTHER_USER_ID/" -H "$A")"
+expect "GET /api/users/999 → 404"         404 "$(curl -si "$API/api/users/999/" -H "$A")"
+expect "PATCH /api/users/$MY_USER_ID own → 200"      200 "$(curl -si -X PATCH "$API/api/users/$MY_USER_ID/" \
+  -H "$A" -H "Content-Type: application/json" -d '{"username":"wbekkal"}')"
+expect "PATCH /api/users/$OTHER_USER_ID other → 403" 403 "$(curl -si -X PATCH "$API/api/users/$OTHER_USER_ID/" \
+  -H "$A" -H "Content-Type: application/json" -d '{"username":"hacker"}')"
+
+# Email privacy
+curl -s "$API/api/users/$OTHER_USER_ID/" -H "$A" | grep -q '"email"' \
+  && { echo -e "$R Email exposed on other profile$NC"; ((fail++)); } \
+  || { echo -e "$G Email hidden on other profile$NC"; ((pass++)); }
+curl -s "$API/api/users/$MY_USER_ID/" -H "$A" | grep -q '"email"' \
+  && { echo -e "$G Email present on own profile$NC"; ((pass++)); } \
+  || { echo -e "$R Email missing on own profile$NC"; ((fail++)); }
+
+# ── MOVIES ──
+echo -e "\n── 3) MOVIES ──"
+expect "GET /api/movies no auth → 200"   200 "$(curl -si "$API/api/movies/")"
+expect "GET /api/movies auth → 200"      200 "$(curl -si "$API/api/movies/" -H "$A")"
+expect "GET /api/movies/$TEST_MOVIE_ID → 200" 200 "$(curl -si "$API/api/movies/$TEST_MOVIE_ID/" -H "$A")"
+
+# ── COMMENTS ──
+echo -e "\n── 4) COMMENTS ──"
+expect "GET /api/comments no auth → 401"  401 "$(curl -si "$API/api/comments/")"
+expect "GET /api/comments auth → 200"     200 "$(curl -si "$API/api/comments/" -H "$A")"
+
+CID=$(curl -s -X POST "$API/api/comments/" -H "$A" -H "Content-Type: application/json" \
+  -d "{\"movie_id\":$TEST_MOVIE_ID,\"content\":\"test\"}" \
+  | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+expect "POST /api/comments → 201"        201 "$(curl -si -X POST "$API/api/comments/" \
+  -H "$A" -H "Content-Type: application/json" -d "{\"movie_id\":$TEST_MOVIE_ID,\"content\":\"x\"}")"
+expect "POST /api/movies/:id/comments → 201" 201 "$(curl -si -X POST "$API/api/movies/$TEST_MOVIE_ID/comments/" \
+  -H "$A" -H "Content-Type: application/json" -d '{"content":"via movie route"}')"
+expect "GET /api/comments/$CID → 200"    200 "$(curl -si "$API/api/comments/$CID/" -H "$A")"
+expect "PATCH /api/comments/$CID → 200"  200 "$(curl -si -X PATCH "$API/api/comments/$CID/" \
+  -H "$A" -H "Content-Type: application/json" -d '{"content":"edited"}')"
+expect "DELETE /api/comments/$CID → 204" 204 "$(curl -si -X DELETE "$API/api/comments/$CID/" -H "$A")"
+
+# ── UNKNOWN /api/ → 404 ──
+echo -e "\n── 5) UNKNOWN ROUTES → 404 ──"
+expect "GET /api/does-not-exist → 404"        404 "$(curl -si "$API/api/does-not-exist/" -H "$A")"
+expect "GET /api/movies/search → 404"         404 "$(curl -si "$API/api/movies/search/" -H "$A")"
+expect "GET /api/register → 404"              404 "$(curl -si "$API/api/register/" -H "$A")"
+
+# ── INTERNAL ROUTES (frontend only) ──
+echo -e "\n── 6) INTERNAL ROUTES ──"
+expect "GET /internal/movies/search no auth → 401" 401 "$(curl -si "$API/internal/movies/search/?q=test")"
+
+# ── FORM VALIDATION ──
+echo -e "\n── 7) FORM VALIDATION ──"
+expect "Register short password → 400"  400 "$(curl -si -X POST "$API/internal/auth/register/" \
   -H "Content-Type: application/json" \
-  -d "{\"username\": \"$USERNAME\", \"password\": \"$PASSWORD\"}")
-
-ACCESS_TOKEN=$(echo "$RESPONSE" | python3 -c "import sys, json; print(json.load(sys.stdin).get('access', ''))")
-
-if [ -z "$ACCESS_TOKEN" ]; then
-  echo "❌ ÉCHEC: Impossible d'obtenir un token."
-  echo "Réponse: $RESPONSE"
-  exit 1
-fi
-echo "✅ Access token obtenu: ${ACCESS_TOKEN:0:40}..."
-AUTH_HEADER="Authorization: Bearer $ACCESS_TOKEN"
-
-# ========= 2) USERS =========
-print_title "2.1) GET /api/v1/users/ sans auth (doit retourner 401)"
-R=$(curl -si "$API/api/v1/users/")
-expect "GET /users sans auth" "401" "$R"
-
-print_title "2.2) GET /api/v1/users/ avec auth (doit retourner 200)"
-R=$(curl -si "$API/api/v1/users/" -H "$AUTH_HEADER")
-expect "GET /users avec auth" "200" "$R"
-echo "$R" | tail -1
-
-print_title "2.3) GET /api/v1/users/$MY_USER_ID/ (mon profil, email doit être présent)"
-R=$(curl -si "$API/api/v1/users/$MY_USER_ID/" -H "$AUTH_HEADER")
-expect "GET /users/me" "200" "$R"
-BODY=$(echo "$R" | tail -1)
-echo "$BODY"
-if echo "$BODY" | grep -q "email"; then
-  echo "✅ email présent dans mon profil"
-else
-  echo "❌ email absent de mon propre profil"
-fi
-
-print_title "2.4) GET /api/v1/users/$OTHER_USER_ID/ (autre profil, email NE DOIT PAS être présent)"
-R=$(curl -si "$API/api/v1/users/$OTHER_USER_ID/" -H "$AUTH_HEADER")
-expect "GET /users/other" "200" "$R"
-BODY=$(echo "$R" | tail -1)
-echo "$BODY"
-if echo "$BODY" | grep -q "email"; then
-  echo "❌ SECURITE: email exposé sur un profil tiers !"
-else
-  echo "✅ email absent du profil tiers"
-fi
-
-print_title "2.5) PATCH /api/v1/users/$MY_USER_ID/ (modifier mon profil → 200)"
-R=$(curl -si -X PATCH "$API/api/v1/users/$MY_USER_ID/" \
-  -H "$AUTH_HEADER" \
+  -d '{"username":"t","email":"t@t.com","first_name":"T","last_name":"T","password":"short"}')"
+expect "Register invalid email → 400"   400 "$(curl -si -X POST "$API/internal/auth/register/" \
   -H "Content-Type: application/json" \
-  -d '{"username": "wbekkal"}')
-expect "PATCH /users/me" "200" "$R"
+  -d '{"username":"t","email":"notemail","first_name":"T","last_name":"T","password":"Valid1234!"}')"
+expect "Register missing fields → 400"  400 "$(curl -si -X POST "$API/internal/auth/register/" \
+  -H "Content-Type: application/json" -d '{"username":"t"}')"
 
-print_title "2.6) PATCH /api/v1/users/$OTHER_USER_ID/ (modifier autre profil → 403)"
-R=$(curl -si -X PATCH "$API/api/v1/users/$OTHER_USER_ID/" \
-  -H "$AUTH_HEADER" \
-  -H "Content-Type: application/json" \
-  -d '{"username": "hacker_try"}')
-expect "PATCH /users/other" "403" "$R"
-
-# ========= 3) MOVIES =========
-print_title "3.1) GET /api/v1/movies/ (frontpage, AllowAny → 200)"
-R=$(curl -si "$API/api/v1/movies/")
-expect "GET /movies sans auth" "200" "$R"
-echo "$R" | tail -1
-
-print_title "3.2) GET /api/v1/movies/$TEST_MOVIE_ID/ (détails → 200)"
-R=$(curl -si "$API/api/v1/movies/$TEST_MOVIE_ID/" -H "$AUTH_HEADER")
-expect "GET /movies/:id" "200" "$R"
-echo "$R" | tail -1
-
-# ========= 4) COMMENTS =========
-print_title "4.1) GET /api/v1/comments/ sans auth (doit retourner 401)"
-R=$(curl -si "$API/api/v1/comments/")
-expect "GET /comments sans auth" "401" "$R"
-
-print_title "4.2) GET /api/v1/comments/ avec auth (→ 200)"
-R=$(curl -si "$API/api/v1/comments/" -H "$AUTH_HEADER")
-expect "GET /comments avec auth" "200" "$R"
-echo "$R" | tail -1
-
-print_title "4.3) POST /api/v1/comments/ (créer un commentaire → 201)"
-R=$(curl -si -X POST "$API/api/v1/comments/" \
-  -H "$AUTH_HEADER" \
-  -H "Content-Type: application/json" \
-  -d "{\"movie_id\": $TEST_MOVIE_ID, \"content\": \"Super film !\"}")
-expect "POST /comments" "201" "$R"
-NEW_COMMENT_ID=$(echo "$R" | tail -1 | python3 -c "import sys, json; print(json.load(sys.stdin).get('id', ''))" 2>/dev/null || echo "")
-echo "Nouveau comment ID: $NEW_COMMENT_ID"
-
-print_title "4.4) POST /api/v1/movies/$TEST_MOVIE_ID/comments/ (variante → 201)"
-R=$(curl -si -X POST "$API/api/v1/movies/$TEST_MOVIE_ID/comments/" \
-  -H "$AUTH_HEADER" \
-  -H "Content-Type: application/json" \
-  -d '{"content": "Commentaire via movie route"}')
-expect "POST /movies/:id/comments" "201" "$R"
-
-COMMENT_ID=${NEW_COMMENT_ID:-1}
-
-print_title "4.5) GET /api/v1/comments/$COMMENT_ID/ (→ 200)"
-R=$(curl -si "$API/api/v1/comments/$COMMENT_ID/" -H "$AUTH_HEADER")
-expect "GET /comments/:id" "200" "$R"
-echo "$R" | tail -1
-
-print_title "4.6) PATCH /api/v1/comments/$COMMENT_ID/ (modifier → 200)"
-R=$(curl -si -X PATCH "$API/api/v1/comments/$COMMENT_ID/" \
-  -H "$AUTH_HEADER" \
-  -H "Content-Type: application/json" \
-  -d '{"content": "Commentaire édité"}')
-expect "PATCH /comments/:id" "200" "$R"
-
-print_title "4.7) DELETE /api/v1/comments/$COMMENT_ID/ (→ 204)"
-R=$(curl -si -X DELETE "$API/api/v1/comments/$COMMENT_ID/" -H "$AUTH_HEADER")
-expect "DELETE /comments/:id" "204" "$R"
-
-# ========= 5) ROUTES INEXISTANTES =========
-print_title "5.1) Route inconnue /api/v1/does-not-exist/ (→ 404)"
-R=$(curl -si "$API/api/v1/does-not-exist/" -H "$AUTH_HEADER")
-expect "GET /api/v1/unknown" "404" "$R"
-
-print_title "5.2) Route interne exposée /internal/movies/search/ (doit exiger auth → 401)"
-R=$(curl -si "$API/internal/movies/search/?q=test")
-expect "GET /internal sans auth" "401" "$R"
-
-print_title "5.3) Ancienne route /api/movies/search/ (doit retourner 404)"
-R=$(curl -si "$API/api/movies/search/" -H "$AUTH_HEADER")
-expect "GET /api/movies/search (hors spec)" "404" "$R"
-
-# ========= 6) SECURITE FORMULAIRES =========
-print_title "6.1) Register mot de passe trop court (→ 400)"
-R=$(curl -si -X POST "$API/internal/auth/register/" \
-  -H "Content-Type: application/json" \
-  -d '{"username":"testuser","email":"test@test.com","first_name":"T","last_name":"T","password":"short"}')
-expect "Register mdp court" "400" "$R"
-
-print_title "6.2) Register email invalide (→ 400)"
-R=$(curl -si -X POST "$API/internal/auth/register/" \
-  -H "Content-Type: application/json" \
-  -d '{"username":"testuser","email":"pasunemail","first_name":"T","last_name":"T","password":"Valid1234!"}')
-expect "Register email invalide" "400" "$R"
-
-print_title "6.3) Login mauvais credentials (→ 401)"
-R=$(curl -si -X POST "$API/oauth/token/" \
-  -H "Content-Type: application/json" \
-  -d '{"username":"fakeuser","password":"wrongpass"}')
-expect "Login mauvais credentials" "401" "$R"
-
-echo
-echo "======================================="
-echo "Tests terminés."
-echo "======================================="
+echo -e "\n══════════════════════════════════"
+echo -e "$G Passed: $pass$NC  $R Failed: $fail$NC"
+echo "══════════════════════════════════"

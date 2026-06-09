@@ -1,5 +1,4 @@
 'use client'
-
 import { useState } from 'react'
 
 export default function ResetPasswordPage() {
@@ -9,12 +8,9 @@ export default function ResetPasswordPage() {
 
   async function handleSubmit(e: React.SyntheticEvent) {
     e.preventDefault()
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
-      setError('Invalid email address')
-      return
-    }
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { setError('Invalid email address'); return }
     setError('')
-    await fetch('http://localhost:8000/api/password-reset/', {
+    await fetch('http://localhost:8000/internal/auth/password-reset/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email }),

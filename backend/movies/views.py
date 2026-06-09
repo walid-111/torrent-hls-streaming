@@ -1,5 +1,5 @@
 import os
-import re
+import time
 import subprocess
 from django.http import StreamingHttpResponse
 from django.utils import timezone
@@ -9,77 +9,20 @@ from rest_framework.response import Response
 from .models import Movie, Comment
 from .services import search_all, start_download, get_playable_file, get_subtitle_text
 
-RANGE_RE = re.compile(r'bytes=(\d+)-(\d*)')
 
-
-def _video_codec(filepath):
+def _file_is_playable(filepath):
+    """ffprobe must read the file successfully → moov atom present + valid stream."""
     try:
         r = subprocess.run(
-            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-             '-show_entries', 'stream=codec_name', '-of', 'csv=p=0', filepath],
-            capture_output=True, timeout=15
+            ['ffprobe', '-v', 'error',
+             '-show_entries', 'stream=codec_name,duration',
+             '-of', 'csv=p=0', filepath],
+            capture_output=True, timeout=10
         )
-        return r.stdout.strip().decode().lower()
+        return r.returncode == 0 and bool(r.stdout.strip())
     except Exception:
-        return ''
-
-
-def _classify(filepath):
-    """
-    Returns:
-      'native'      → mp4/webm with browser-playable codec → range-serve
-      'transcode'   → .mkv or known unplayable codec → live ffmpeg pipe
-      'unsupported' → cannot play, cannot transcode meaningfully
-      'pending'     → can't determine yet (moov atom not downloaded)
-    """
-    ext = os.path.splitext(filepath)[1].lower()
-    codec = _video_codec(filepath)
-
-    if not codec:
-        # ffprobe failed — usually moov atom not yet downloaded
-        return 'pending'
-
-    if ext in ('.mp4', '.webm', '.m4v') and codec in ('h264', 'vp8', 'vp9', 'av1'):
-        return 'native'
-    if ext == '.mkv' or codec in ('mpeg4', 'msmpeg4v3', 'wmv3', 'vc1'):
-        return 'transcode'
-    return 'unsupported'
-
-
-def _range_response(request, filepath):
-    """Serve a file with HTTP Range support. Enables seeking + satisfies Firefox ORB."""
-    file_size = os.path.getsize(filepath)
-    range_header = request.META.get('HTTP_RANGE', '')
-    m = RANGE_RE.match(range_header)
-
-    if m:
-        start = int(m.group(1))
-        end = int(m.group(2)) if m.group(2) else file_size - 1
-        end = min(end, file_size - 1)
-        length = end - start + 1
-        status = 206
-    else:
-        start, end, length, status = 0, file_size - 1, file_size, 200
-
-    def chunks():
-        with open(filepath, 'rb') as f:
-            f.seek(start)
-            remaining = length
-            while remaining > 0:
-                data = f.read(min(65536, remaining))
-                if not data:
-                    break
-                remaining -= len(data)
-                yield data
-
-    resp = StreamingHttpResponse(chunks(), status=status, content_type='video/mp4')
-    resp['Accept-Ranges'] = 'bytes'
-    resp['Content-Length'] = str(length)
-    if status == 206:
-        resp['Content-Range'] = f'bytes {start}-{end}/{file_size}'
-    return resp
-
-
+        return False
+    
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def search(request):
@@ -87,9 +30,7 @@ def search(request):
     page = int(request.GET.get('page', 1))
     min_year = request.GET.get('min_year')
     min_rating = request.GET.get('min_rating')
-
     results = search_all(query, page, min_year, min_rating)
-
     watched = set(Movie.objects.filter(watched_by=request.user).values_list('magnet', flat=True))
     for r in results:
         r['watched'] = r['magnet'] in watched
@@ -103,7 +44,6 @@ def start_stream(request):
     title = request.data.get('title', 'Unknown')
     if not magnet:
         return Response({'error': 'magnet required'}, status=400)
-
     movie, _ = Movie.objects.get_or_create(magnet=magnet, defaults={'title': title})
     movie.watched_by.add(request.user)
     movie.last_watched = timezone.now()
@@ -130,43 +70,52 @@ def stream_video(request, movie_id):
     if not filepath:
         return Response({'error': 'File not ready'}, status=404)
 
-    kind = _classify(filepath)
+    # CRITICAL: ffprobe gate. If the file isn't readable yet (moov atom not
+    # downloaded), don't even start ffmpeg — it would produce garbage.
+    if not _file_is_playable(filepath):
+        return Response({'error': 'Stream not ready'}, status=503)
 
-    if kind == 'native':
-        return _range_response(request, filepath)
-
-    if kind == 'unsupported' or kind == 'pending':
-        return Response({'error': 'Not ready'}, status=404)
-
-    # mkv → live fragmented-mp4 transcode pipe
     cmd = [
         'ffmpeg',
-        '-fflags', '+genpts+igndts',
-        '-err_detect', 'ignore_err',
         '-i', filepath,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
         '-c:a', 'aac', '-ac', '2', '-b:a', '128k',
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moof+faststart',
-        '-frag_duration', '1000000',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+        '-frag_duration', '500000',
         '-f', 'mp4',
         '-loglevel', 'error',
         'pipe:1',
     ]
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.DEVNULL, bufsize=0)
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+
+    # Pre-buffer first fragment so the browser receives a valid mp4 init.
+    buffered = bytearray()
+    deadline = time.time() + 15
+    while len(buffered) < 256 * 1024 and time.time() < deadline:
+        chunk = process.stdout.read(65536)
+        if not chunk:
+            if process.poll() is not None:
+                break
+            time.sleep(0.1)
+            continue
+        buffered.extend(chunk)
+
+    if len(buffered) < 1024:
+        try: process.kill()
+        except: pass
+        return Response({'error': 'Stream not ready'}, status=503)
 
     def stream():
         try:
+            yield bytes(buffered)
             while True:
                 chunk = process.stdout.read(65536)
                 if not chunk:
                     break
                 yield chunk
         finally:
-            try:
-                process.kill()
-            except Exception:
-                pass
+            try: process.kill()
+            except: pass
 
     resp = StreamingHttpResponse(stream(), content_type='video/mp4')
     resp['Accept-Ranges'] = 'none'
@@ -181,27 +130,20 @@ def movie_status(request, movie_id):
     try:
         movie = Movie.objects.get(id=movie_id)
     except Movie.DoesNotExist:
-        return Response({'ready': False, 'status': 'downloading'})
+        return Response({'ready': False})
 
     filepath = None
     if movie.file_path and os.path.exists(movie.file_path):
         filepath = movie.file_path
     else:
         f = get_playable_file(movie.folder)
-        if f and os.path.exists(f) and os.path.getsize(f) > 5 * 1024 * 1024:
+        if f and os.path.exists(f):
             filepath = f
 
-    if not filepath:
-        return Response({'ready': False, 'status': 'downloading'})
-
-    kind = _classify(filepath)
-    if kind == 'pending':
-        # File exists but moov atom not yet downloaded — keep waiting
-        return Response({'ready': False, 'status': 'downloading'})
-    if kind == 'unsupported':
-        return Response({'ready': False, 'status': 'unsupported'})
-
-    return Response({'ready': True, 'status': 'ready'})
+    # Ready ONLY if ffprobe can actually read the file.
+    if filepath and _file_is_playable(filepath):
+        return Response({'ready': True})
+    return Response({'ready': False})
 
 
 @api_view(['GET'])

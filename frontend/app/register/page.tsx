@@ -1,5 +1,4 @@
 'use client'
-
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 
@@ -25,8 +24,7 @@ export default function RegisterPage() {
     e.preventDefault()
     const err = validate()
     if (err) { setError(err); return }
-
-    const res = await fetch('http://localhost:8000/api/register/', {
+    const res = await fetch('http://localhost:8000/internal/auth/register/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(form),

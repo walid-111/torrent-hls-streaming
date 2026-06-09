@@ -67,9 +67,9 @@ def user_detail(request, pk):
     except User.DoesNotExist:
         return Response({'error': 'Not found'}, status=404)
     data = UserSerializer(user).data
-    data.pop('email')
+    if request.user.id != user.id:
+        data.pop('email', None)
     return Response(data)
-
 
 @api_view(['GET'])
 @permission_classes([AllowAny])

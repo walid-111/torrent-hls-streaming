@@ -1,5 +1,4 @@
 'use client'
-
 import { useState, useEffect } from 'react'
 import { useAuth } from '../components/useAuth'
 
@@ -12,12 +11,12 @@ export default function ProfilePage() {
   const [error, setError] = useState('')
 
   useEffect(() => {
-    fetch('http://localhost:8000/api/profile/', { credentials: 'include' })
+    fetch('http://localhost:8000/internal/auth/profile/', { credentials: 'include' })
       .then(res => res.ok ? res.json() : null)
       .then(data => {
         if (!data) return
         setUser(data)
-        setForm({ email: data.email, bio: data.bio, preferred_language: data.preferred_language, avatar: null })
+        setForm({ email: data.email, bio: data.bio || '', preferred_language: data.preferred_language || 'en', avatar: null })
       })
   }, [])
 
@@ -34,10 +33,7 @@ export default function ProfilePage() {
 
   async function handleSubmit(e: React.SyntheticEvent) {
     e.preventDefault()
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(form.email)) {
-      setError('Invalid email address')
-      return
-    }
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(form.email)) { setError('Invalid email address'); return }
     setError('')
     const csrf = document.cookie.split('; ').find(r => r.startsWith('csrftoken='))?.split('=')[1] || ''
     const data = new FormData()
@@ -46,7 +42,7 @@ export default function ProfilePage() {
     data.append('preferred_language', form.preferred_language)
     if (form.avatar) data.append('avatar', form.avatar)
 
-    const res = await fetch('http://localhost:8000/api/profile/', {
+    const res = await fetch('http://localhost:8000/internal/auth/profile/', {
       method: 'PATCH',
       headers: { 'X-CSRFToken': csrf },
       credentials: 'include',
@@ -74,12 +70,8 @@ export default function ProfilePage() {
       <form onSubmit={handleSubmit} className="flex flex-col gap-3" noValidate>
         <div className="flex flex-col items-center gap-3">
           {(preview || user.avatar) && (
-            <img
-              src={preview || `http://localhost:8000${user.avatar}`}
-              className="w-24 h-24 rounded-full object-cover"
-              style={{ background: '#ece7dc' }}
-              alt=""
-            />
+            <img src={preview || `http://localhost:8000${user.avatar}`}
+              className="w-24 h-24 rounded-full object-cover" style={{ background: '#ece7dc' }} alt="" />
           )}
           <label className="btn cursor-pointer text-sm">
             Choose photo

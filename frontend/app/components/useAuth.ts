@@ -1,19 +1,22 @@
 'use client'
-
 import { useState, useEffect } from 'react'
-import { useRouter } from 'next/navigation'
+import { useRouter, usePathname } from 'next/navigation'
+
+const PUBLIC_PATHS = ['/login', '/register', '/reset-password', '/reset-password/confirm']
 
 export function useAuth() {
   const router = useRouter()
+  const pathname = usePathname()
   const [ready, setReady] = useState(false)
 
   useEffect(() => {
-    fetch('http://localhost:8000/api/profile/', { credentials: 'include' })
+    if (PUBLIC_PATHS.includes(pathname)) return
+    fetch('http://localhost:8000/internal/auth/profile/', { credentials: 'include' })
       .then(res => {
         if (!res.ok) router.replace('/login')
         else setReady(true)
       })
-  }, [])
+  }, [pathname])
 
   return ready
 }

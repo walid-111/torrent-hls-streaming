@@ -1,5 +1,4 @@
 'use client'
-
 import { useState, Suspense } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 
@@ -11,11 +10,8 @@ function ConfirmForm() {
 
   async function handleSubmit(e: React.SyntheticEvent) {
     e.preventDefault()
-    if (password.length < 8) {
-      setError('Password must be at least 8 characters')
-      return
-    }
-    const res = await fetch('http://localhost:8000/api/password-reset/confirm/', {
+    if (password.length < 8) { setError('Password must be at least 8 characters'); return }
+    const res = await fetch('http://localhost:8000/internal/auth/password-reset/confirm/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -42,9 +38,5 @@ function ConfirmForm() {
 }
 
 export default function ConfirmPage() {
-  return (
-    <Suspense>
-      <ConfirmForm />
-    </Suspense>
-  )
+  return <Suspense><ConfirmForm /></Suspense>
 }

@@ -1,29 +1,34 @@
 'use client'
-
 import { useState } from 'react'
+import { useRouter } from 'next/navigation'
 
 export default function LoginPage() {
+  const router = useRouter()
   const [form, setForm] = useState({ username: '', password: '' })
   const [error, setError] = useState('')
 
   async function handleSubmit(e: React.SyntheticEvent) {
     e.preventDefault()
-    if (!form.username || !form.password) {
-      setError('Username and password are required')
-      return
-    }
-    const res = await fetch('http://localhost:8000/api/login/', {
+    if (!form.username || !form.password) { setError('All fields are required'); return }
+    setError('')
+    const res = await fetch('http://localhost:8000/internal/auth/login/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       credentials: 'include',
       body: JSON.stringify(form),
     })
-    if (res.ok) window.location.href = '/library'
+    if (res.ok) router.push('/library')
     else setError('Invalid username or password')
   }
 
-  async function handleOAuth(provider: string) {
-    const res = await fetch(`http://localhost:8000/api/auth/${provider}/`, { credentials: 'include' })
+  async function handle42() {
+    const res = await fetch('http://localhost:8000/internal/auth/auth/42/')
+    const data = await res.json()
+    window.location.href = data.url
+  }
+
+  async function handleGithub() {
+    const res = await fetch('http://localhost:8000/internal/auth/auth/github/')
     const data = await res.json()
     window.location.href = data.url
   }
@@ -39,12 +44,12 @@ export default function LoginPage() {
           onChange={e => setForm({ ...form, password: e.target.value })} />
         <button className="btn" type="submit">Login</button>
       </form>
-      <div className="mt-5 text-sm flex flex-col gap-2">
-        <a href="/register" className="link">Create an account</a>
-        <a href="/reset-password" className="link">Forgot password?</a>
-        <button onClick={() => handleOAuth('42')} className="link text-left">Login with 42</button>
-        <button onClick={() => handleOAuth('github')} className="link text-left">Login with GitHub</button>
+      <div className="flex flex-col gap-2 mt-4">
+        <button onClick={handle42} className="btn">Login with 42</button>
+        <button onClick={handleGithub} className="btn">Login with GitHub</button>
       </div>
+      <a href="/register" className="link text-sm mt-5 block">No account? Register</a>
+      <a href="/reset-password" className="link text-sm mt-2 block">Forgot password?</a>
     </div>
   )
 }

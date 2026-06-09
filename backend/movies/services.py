@@ -243,10 +243,38 @@ def start_download(torrent_url, movie_id):
     def monitor():
         from .models import Movie
         from django.utils import timezone
+        stuck_seconds = 0
+        last_progress = handle.status().progress  # ← start from current, not 0
         while handle.status().progress < 0.999:
             s = handle.status()
             print(f"Movie {movie_id}: {s.progress*100:.1f}% ({s.download_rate/1000:.0f} kB/s)", flush=True)
+
+            if s.progress <= last_progress + 0.001 and s.download_rate < 1000:
+                stuck_seconds += 3
+            else:
+                stuck_seconds = 0
+                last_progress = s.progress
+
+            if stuck_seconds >= 60 and s.progress >= 0.90:
+                print(f"Movie {movie_id}: stuck at {s.progress*100:.1f}%, marking as complete", flush=True)
+                break
+
+            if stuck_seconds >= 180:
+                print(f"Movie {movie_id}: dead torrent, giving up", flush=True)
+                active_downloads.pop(torrent_url, None)
+                try: session.remove_torrent(handle)
+                except: pass
+                return
+
             time.sleep(3)
+
+        path = _find_video(os.path.join(DOWNLOAD_PATH, info.name()))
+        if path:
+            Movie.objects.filter(id=movie_id).update(
+                file_path=path, length=_get_duration(path), last_watched=timezone.now()
+            )
+        print(f"Movie {movie_id}: complete", flush=True)
+
         path = _find_video(os.path.join(DOWNLOAD_PATH, info.name()))
         if path:
             Movie.objects.filter(id=movie_id).update(

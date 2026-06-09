@@ -1,5 +1,4 @@
 'use client'
-
 import { useState, useEffect, useRef, Suspense } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
 
@@ -18,7 +17,7 @@ function MovieContent() {
   try { casting = JSON.parse(params.get('casting') || 'null') } catch {}
 
   const [movieId, setMovieId] = useState<number | null>(null)
-  const [status, setStatus] = useState<string>('downloading')
+  const [ready, setReady] = useState(false)
   const [comments, setComments] = useState<any[]>([])
   const [comment, setComment] = useState('')
   const [subtitles, setSubtitles] = useState<any[]>([])
@@ -31,7 +30,7 @@ function MovieContent() {
   useEffect(() => {
     if (!magnet || startedRef.current) return
     startedRef.current = true
-    fetch('http://localhost:8000/api/movies/start/', {
+    fetch('http://localhost:8000/internal/movies/start/', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCsrf() },
       credentials: 'include',
@@ -48,28 +47,28 @@ function MovieContent() {
   }, [magnet])
 
   useEffect(() => {
-    if (!movieId || status === 'ready' || status === 'unsupported') return
+    if (!movieId || ready) return
     const interval = setInterval(() => {
-      fetch(`http://localhost:8000/api/movies/status/${movieId}/`, { credentials: 'include' })
+      fetch(`http://localhost:8000/internal/movies/status/${movieId}/`, { credentials: 'include' })
         .then(res => res.json())
         .then(data => {
-          if (data.status) setStatus(data.status)
-          if (data.status === 'ready' || data.status === 'unsupported') {
+          if (data.ready) {
+            setReady(true)
             clearInterval(interval)
           }
         })
         .catch(() => {})
     }, 2000)
     return () => clearInterval(interval)
-  }, [movieId, status])
+  }, [movieId, ready])
 
   function loadComments(id: number) {
-    fetch(`http://localhost:8000/api/movies/${id}/comments/`, { credentials: 'include' })
+    fetch(`http://localhost:8000/internal/movies/${id}/comments/`, { credentials: 'include' })
       .then(res => res.json()).then(setComments).catch(() => {})
   }
 
   function loadSubtitles(id: number) {
-    fetch(`http://localhost:8000/api/movies/${id}/subtitles/`, { credentials: 'include' })
+    fetch(`http://localhost:8000/internal/movies/${id}/subtitles/`, { credentials: 'include' })
       .then(res => res.json())
       .then(data => {
         const list = (data.subtitles || []).map((s: any) => {
@@ -84,7 +83,7 @@ function MovieContent() {
   async function postComment(e: React.SyntheticEvent) {
     e.preventDefault()
     if (!movieId || !comment) return
-    await fetch(`http://localhost:8000/api/movies/${movieId}/comments/`, {
+    await fetch(`http://localhost:8000/internal/movies/${movieId}/comments/`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCsrf() },
       credentials: 'include',
@@ -100,12 +99,8 @@ function MovieContent() {
 
       <div className="flex gap-5 mb-6">
         {cover && (
-          <img
-            src={cover}
-            alt={title || ''}
-            className="rounded card object-contain self-start"
-            style={{ width: '140px', height: 'auto' }}
-          />
+          <img src={cover} alt={title || ''} className="rounded card object-contain self-start"
+            style={{ width: '140px', height: 'auto' }} />
         )}
         <div className="flex-1">
           <h1 className="text-2xl font-bold">{title}</h1>
@@ -123,26 +118,16 @@ function MovieContent() {
         </div>
       </div>
 
-      {movieId && status === 'downloading' && (
+      {!ready && movieId && (
         <div className="card p-12 text-center mb-6 flex flex-col items-center gap-4">
           <div className="spinner" />
           <p className="muted">Preparing video, download in progress...</p>
         </div>
       )}
 
-      {movieId && status === 'unsupported' && (
-        <div className="card p-12 text-center mb-6">
-          <p className="text-red-600 font-semibold mb-2">Unsupported video format</p>
-          <p className="muted text-sm">
-            This video uses a codec or container that cannot be played in the browser.
-            Only mp4, webm, and mkv files are supported.
-          </p>
-        </div>
-      )}
-
-      {movieId && status === 'ready' && (
-        <video key={movieId} className="w-full rounded mb-6 card" controls preload="metadata">
-          <source src={`http://localhost:8000/api/movies/stream/${movieId}/`} type="video/mp4" />
+      {ready && movieId && (
+        <video key={movieId} className="w-full rounded mb-6 card" controls preload="auto">
+          <source src={`http://localhost:8000/internal/movies/stream/${movieId}/`} type="video/mp4" />
           {subtitles.map((s, i) => (
             <track key={i} kind="subtitles" src={s.url} srcLang={s.lang}
               label={s.lang === 'en' ? 'English' : s.lang} default={s.lang === 'en'} />
@@ -169,9 +154,5 @@ function MovieContent() {
 }
 
 export default function MoviePage() {
-  return (
-    <Suspense>
-      <MovieContent />
-    </Suspense>
-  )
+  return <Suspense><MovieContent /></Suspense>
 }

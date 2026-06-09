@@ -6,7 +6,6 @@ urlpatterns = [
     path('login/', views.login_view),
     path('logout/', views.logout_view),
     path('profile/', views.profile),
-    path('users/<int:pk>/', views.user_detail),
     path('auth/42/', views.auth_42),
     path('auth/42/callback/', views.auth_42_callback),
     path('auth/github/', views.auth_github),

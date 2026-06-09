@@ -1,26 +1,30 @@
 'use client'
-
 import { useState, useEffect } from 'react'
-import { useRouter } from 'next/navigation'
+import { useRouter, usePathname } from 'next/navigation'
+
+const PUBLIC_PATHS = ['/login', '/register', '/reset-password', '/reset-password/confirm']
 
 export default function Nav() {
   const router = useRouter()
+  const pathname = usePathname()
   const [loggedIn, setLoggedIn] = useState(false)
 
   useEffect(() => {
-    fetch('http://localhost:8000/api/profile/', { credentials: 'include' })
+    if (PUBLIC_PATHS.includes(pathname)) { setLoggedIn(false); return }
+    fetch('http://localhost:8000/internal/auth/profile/', { credentials: 'include' })
       .then(res => setLoggedIn(res.ok))
-  }, [])
+  }, [pathname])
 
-  async function handleLogout() {
+  function handleLogout() {
     const csrf = document.cookie.split('; ').find(r => r.startsWith('csrftoken='))?.split('=')[1] || ''
-    await fetch('http://localhost:8000/api/logout/', {
+    fetch('http://localhost:8000/internal/auth/logout/', {
       method: 'POST',
       headers: { 'X-CSRFToken': csrf },
       credentials: 'include',
+    }).finally(() => {
+      setLoggedIn(false)
+      router.push('/login')
     })
-    setLoggedIn(false)
-    router.push('/login')
   }
 
   if (!loggedIn) return null

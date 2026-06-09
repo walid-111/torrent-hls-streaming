@@ -99,8 +99,13 @@ function MovieContent() {
 
       <div className="flex gap-5 mb-6">
         {cover && (
-          <img src={cover} alt={title || ''} className="rounded card object-contain self-start"
-            style={{ width: '140px', height: 'auto' }} />
+          <img
+            src={cover}
+            alt={title || ''}
+            className="rounded card object-contain self-start"
+            style={{ width: '140px', height: 'auto' }}
+            onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }}
+          />
         )}
         <div className="flex-1">
           <h1 className="text-2xl font-bold">{title}</h1>

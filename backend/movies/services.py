@@ -83,63 +83,44 @@ def search_archive(query, page=1, min_year=None, min_rating=None):
     return results
 
 
-def search_yts(query, page=1, min_year=None, min_rating=None):
-    params = {
-        'limit': 20,
-        'page': page,
-        'sort_by': 'download_count' if not query else 'title',
-        'order_by': 'desc',
-    }
+def search_archive_classic(query, page=1, min_year=None, min_rating=None):
+    """Second source: archive.org's classic_tv_movies collection (different from feature_films)."""
     if query:
-        params['query_term'] = query
-    if min_rating:
-        params['minimum_rating'] = int(float(min_rating))
+        q = f"title:({query})+AND+collection:(classic_tv_movies)"
+    else:
+        q = "collection:(classic_tv_movies)+AND+mediatype:(movies)+AND+format:(MPEG4)"
+    if min_year:
+        q += f"+AND+year:[{min_year}+TO+9999]"
 
+    url = (
+        f"https://archive.org/advancedsearch.php?q={q}"
+        f"&fl[]=identifier,title,year,avg_rating,description"
+        f"&sort[]=week+desc&output=json&rows=10&page={page}"
+    )
     try:
-        r = requests.get('https://yts.mx/api/v2/list_movies.json', params=params, timeout=10)
-        data = r.json().get('data', {})
-        movies = data.get('movies', []) or []
-    except Exception:
+        docs = requests.get(url, timeout=10).json().get('response', {}).get('docs', [])
+    except:
         return []
 
     results = []
-    for m in movies:
-        year = m.get('year')
-        if min_year and year and int(year) < int(min_year):
+    for item in docs:
+        ident = item.get('identifier')
+        title = item.get('title', '')
+        rating = item.get('avg_rating')
+        _, casting = _tmdb(title)
+        if not rating:
+            rating, _ = _tmdb(title)
+        if min_rating and (not rating or float(rating) < float(min_rating)):
             continue
-
-        # Pick best torrent (prefer 1080p, fallback to 720p, then anything)
-        torrents = m.get('torrents', []) or []
-        chosen = None
-        for q in ('1080p', '720p'):
-            chosen = next((t for t in torrents if t.get('quality') == q), None)
-            if chosen:
-                break
-        if not chosen and torrents:
-            chosen = torrents[0]
-        if not chosen:
-            continue
-
-        # YTS gives a torrent .torrent URL via "url" field
-        torrent_url = chosen.get('url')
-        if not torrent_url:
-            continue
-
-        casting = {
-            'director': None,
-            'producer': None,
-            'cast': [c.get('name') for c in (m.get('cast') or [])[:5] if c.get('name')],
-        }
-
         results.append({
-            'title': m.get('title', ''),
-            'magnet': torrent_url,
-            'cover': m.get('large_cover_image') or m.get('medium_cover_image') or '',
-            'year': year,
-            'rating': m.get('rating'),
-            'summary': m.get('summary') or m.get('description_full') or '',
+            'title': title,
+            'magnet': f"https://archive.org/download/{ident}/{ident}_archive.torrent",
+            'cover': f"https://archive.org/services/img/{ident}",
+            'year': item.get('year'),
+            'rating': rating,
+            'summary': item.get('description', ''),
             'casting': casting,
-            'source': 'yts',
+            'source': 'archive.org/classic_tv',
         })
     return results
 
@@ -148,7 +129,8 @@ def search_all(query, page=1, min_year=None, min_rating=None):
     if page > 20:
         return []
     results = search_archive(query, page, min_year, min_rating)
-    results += search_yts(query, page, min_year, min_rating)
+    if page <= 3:
+        results += search_archive_classic(query, page, min_year, min_rating)
     if query:
         results.sort(key=lambda r: r['title'].lower())
     return results
@@ -162,7 +144,6 @@ def _find_video(folder):
             ext = os.path.splitext(f)[1].lower()
             if ext in preferred:
                 full = os.path.join(root, f)
-                # keep the biggest of each extension
                 if ext not in found or os.path.getsize(full) > os.path.getsize(found[ext]):
                     found[ext] = full
     for ext in preferred:
@@ -183,41 +164,55 @@ def _get_duration(filepath):
         return None
 
 
-def start_download(torrent_url, movie_id):
-    from .models import Movie
-
-    movie = Movie.objects.filter(id=movie_id).first()
-    file_missing = movie and movie.file_path and not os.path.exists(movie.file_path)
-
-    if file_missing:
-        Movie.objects.filter(id=movie_id).update(file_path='')
-        old = active_downloads.pop(torrent_url, None)
-        if old:
-            try:
-                session.remove_torrent(old)
-            except:
-                pass
-
-    if torrent_url in active_downloads:
-        return
+def _load_torrent_info(torrent_url):
+    """Load torrent_info from .torrent file URL"""
+    if torrent_url.startswith('magnet:'):
+        params = lt.parse_magnet_uri(torrent_url)
+        params.save_path = DOWNLOAD_PATH
+        handle = session.add_torrent(params)
+        for _ in range(30):
+            if handle.status().has_metadata:
+                return handle, handle.torrent_file()
+            time.sleep(1)
+        try: session.remove_torrent(handle)
+        except: pass
+        return None, None
 
     try:
         data = requests.get(torrent_url, timeout=10).content
         info = lt.torrent_info(lt.bdecode(data))
+        handle = session.add_torrent({
+            'ti': info,
+            'save_path': DOWNLOAD_PATH,
+            'storage_mode': lt.storage_mode_t.storage_mode_sparse,
+        })
+        return handle, info
     except:
+        return None, None
+
+
+def start_download(torrent_url, movie_id):
+    from .models import Movie
+
+    movie = Movie.objects.filter(id=movie_id).first()
+    if movie and movie.file_path and not os.path.exists(movie.file_path):
+        Movie.objects.filter(id=movie_id).update(file_path='')
+        old = active_downloads.pop(torrent_url, None)
+        if old:
+            try: session.remove_torrent(old)
+            except: pass
+
+    if torrent_url in active_downloads:
         return
 
-    handle = session.add_torrent({
-        'ti': info,
-        'save_path': DOWNLOAD_PATH,
-        'storage_mode': lt.storage_mode_t.storage_mode_sparse,
-    })
-    # Sequential download: pieces arrive in order, from start to end,
-    # so ffmpeg can read the file progressively as it grows.
-    # handle.set_sequential_download(True)
+    handle, info = _load_torrent_info(torrent_url)
+    if not handle or not info:
+        print(f"Movie {movie_id}: failed to load torrent", flush=True)
+        return
 
+    # Pick largest video file
     files = info.files()
-    preferred = ['.mp4', '.webm', '.mkv', '.avi', '.mov', '.mpeg', '.mpg']
+    preferred = ['.mp4', '.webm', '.mkv', '.avi', '.mov']
     target = None
     for ext in preferred:
         for i in range(info.num_files()):
@@ -228,25 +223,20 @@ def start_download(torrent_url, movie_id):
             break
 
     if target is not None:
-            priorities = [0] * info.num_files()
-            priorities[target] = 7
-            handle.prioritize_files(priorities)
+        priorities = [0] * info.num_files()
+        priorities[target] = 7
+        handle.prioritize_files(priorities)
 
-            # Prioritize the head AND tail pieces of the target file.
-            # Many mp4s have the moov atom (the index ffmpeg needs) at the very END,
-            # so without this the file is unplayable until 100% download.
-            fs = info.files()
-            file_offset = fs.file_offset(target)
-            file_size = fs.file_size(target)
-            piece_len = info.piece_length()
-
-            first_piece = file_offset // piece_len
-            last_piece = (file_offset + file_size - 1) // piece_len
-
-            for p in range(first_piece, min(first_piece + 5, last_piece + 1)):
-                handle.piece_priority(p, 7)
-            for p in range(max(last_piece - 9, first_piece), last_piece + 1):
-                handle.piece_priority(p, 7)
+        # Head + tail pieces priority (moov atom often at end)
+        file_offset = files.file_offset(target)
+        file_size = files.file_size(target)
+        piece_len = info.piece_length()
+        first_piece = file_offset // piece_len
+        last_piece = (file_offset + file_size - 1) // piece_len
+        for p in range(first_piece, min(first_piece + 5, last_piece + 1)):
+            handle.piece_priority(p, 7)
+        for p in range(max(last_piece - 9, first_piece), last_piece + 1):
+            handle.piece_priority(p, 7)
 
     active_downloads[torrent_url] = handle
     Movie.objects.filter(id=movie_id).update(folder=info.name())
@@ -255,28 +245,24 @@ def start_download(torrent_url, movie_id):
         from .models import Movie
         from django.utils import timezone
         stuck_seconds = 0
-        last_progress = handle.status().progress  # ← start from current, not 0
+        last_progress = handle.status().progress
         while handle.status().progress < 0.999:
             s = handle.status()
             print(f"Movie {movie_id}: {s.progress*100:.1f}% ({s.download_rate/1000:.0f} kB/s)", flush=True)
-
             if s.progress <= last_progress + 0.001 and s.download_rate < 1000:
                 stuck_seconds += 3
             else:
                 stuck_seconds = 0
                 last_progress = s.progress
-
             if stuck_seconds >= 60 and s.progress >= 0.90:
-                print(f"Movie {movie_id}: stuck at {s.progress*100:.1f}%, marking as complete", flush=True)
+                print(f"Movie {movie_id}: stuck at {s.progress*100:.1f}%, marking complete", flush=True)
                 break
-
             if stuck_seconds >= 180:
-                print(f"Movie {movie_id}: dead torrent, giving up", flush=True)
+                print(f"Movie {movie_id}: dead torrent", flush=True)
                 active_downloads.pop(torrent_url, None)
                 try: session.remove_torrent(handle)
                 except: pass
                 return
-
             time.sleep(3)
 
         path = _find_video(os.path.join(DOWNLOAD_PATH, info.name()))
@@ -286,14 +272,8 @@ def start_download(torrent_url, movie_id):
             )
         print(f"Movie {movie_id}: complete", flush=True)
 
-        path = _find_video(os.path.join(DOWNLOAD_PATH, info.name()))
-        if path:
-            Movie.objects.filter(id=movie_id).update(
-                file_path=path, length=_get_duration(path), last_watched=timezone.now()
-            )
-        print(f"Movie {movie_id}: complete", flush=True)
-
     threading.Thread(target=monitor, daemon=True).start()
+
 
 def get_playable_file(folder_name):
     if not folder_name:
@@ -305,16 +285,14 @@ def get_playable_file(folder_name):
 
 
 def _srt_to_vtt(srt_text):
-    # Browser <track> only reads WebVTT. Convert the srt timestamps
-    def fix_timestamp(match):
-        h, m, s, ms = match.group(1), match.group(2), match.group(3), match.group(4)
+    def fix(m):
+        h, mn, s, ms = m.group(1), m.group(2), m.group(3), m.group(4)
         ms = (ms + '000')[:3]
-        return f"{h}:{m}:{s}.{ms}"
-
+        return f"{h}:{mn}:{s}.{ms}"
     lines = ['WEBVTT', '']
     for line in srt_text.splitlines():
         if '-->' in line:
-            line = re.sub(r'(\d{2}):(\d{2}):(\d{2})[,.](\d+)', fix_timestamp, line)
+            line = re.sub(r'(\d{2}):(\d{2}):(\d{2})[,.](\d+)', fix, line)
         lines.append(line)
     return '\n'.join(lines)
 

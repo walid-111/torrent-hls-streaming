@@ -18,14 +18,24 @@ export default function UserProfilePage({ params }: { params: Promise<{ id: stri
 
   if (!user) return <p className="p-8 muted">Loading...</p>
 
+  const avatarUrl = user.avatar
+    ? (user.avatar.startsWith('http') ? user.avatar : `http://localhost:8000${user.avatar}`)
+    : null
+
   return (
     <div className="max-w-md mx-auto mt-16 p-8 card text-center">
-      {user.avatar
-        ? <img src={`http://localhost:8000${user.avatar}`} className="w-24 h-24 rounded-full mx-auto mb-4 object-cover" alt="" />
-        : <div className="w-24 h-24 rounded-full mx-auto mb-4 flex items-center justify-center muted" style={{ background: '#ece7dc' }}>No photo</div>}
+      {avatarUrl ? (
+        <img src={avatarUrl} className="w-24 h-24 rounded-full mx-auto mb-4 object-cover" alt=""
+          onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }} />
+      ) : (
+        <div className="w-24 h-24 rounded-full mx-auto mb-4 flex items-center justify-center muted"
+          style={{ background: '#ece7dc' }}>No photo</div>
+      )}
       <h1 className="text-xl font-bold mb-1">@{user.username}</h1>
-      <p className="muted mb-4">{user.first_name} {user.last_name}</p>
-      {user.bio && <p className="text-sm">{user.bio}</p>}
+      {(user.first_name || user.last_name) && (
+        <p className="muted mb-4">{user.first_name} {user.last_name}</p>
+      )}
+      {user.bio ? <p className="text-sm">{user.bio}</p> : <p className="text-sm muted">No bio</p>}
     </div>
   )
 }

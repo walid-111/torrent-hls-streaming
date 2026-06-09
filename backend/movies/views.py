@@ -11,18 +11,19 @@ from .services import search_all, start_download, get_playable_file, get_subtitl
 
 
 def _file_is_playable(filepath):
-    """ffprobe must read the file successfully → moov atom present + valid stream."""
+    """ffprobe must successfully read the file. Means moov atom is present."""
     try:
         r = subprocess.run(
             ['ffprobe', '-v', 'error',
-             '-show_entries', 'stream=codec_name,duration',
+             '-show_entries', 'stream=codec_name',
              '-of', 'csv=p=0', filepath],
             capture_output=True, timeout=10
         )
         return r.returncode == 0 and bool(r.stdout.strip())
     except Exception:
         return False
-    
+
+
 @api_view(['GET'])
 @permission_classes([IsAuthenticated])
 def search(request):
@@ -67,12 +68,7 @@ def stream_video(request, movie_id):
         f = get_playable_file(movie.folder)
         if f and os.path.exists(f):
             filepath = f
-    if not filepath:
-        return Response({'error': 'File not ready'}, status=404)
-
-    # CRITICAL: ffprobe gate. If the file isn't readable yet (moov atom not
-    # downloaded), don't even start ffmpeg — it would produce garbage.
-    if not _file_is_playable(filepath):
+    if not filepath or not _file_is_playable(filepath):
         return Response({'error': 'Stream not ready'}, status=503)
 
     cmd = [
@@ -88,7 +84,7 @@ def stream_video(request, movie_id):
     ]
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
 
-    # Pre-buffer first fragment so the browser receives a valid mp4 init.
+    # Pre-buffer the init segment so the browser receives a valid mp4 immediately
     buffered = bytearray()
     deadline = time.time() + 15
     while len(buffered) < 256 * 1024 and time.time() < deadline:
@@ -140,7 +136,6 @@ def movie_status(request, movie_id):
         if f and os.path.exists(f):
             filepath = f
 
-    # Ready ONLY if ffprobe can actually read the file.
     if filepath and _file_is_playable(filepath):
         return Response({'ready': True})
     return Response({'ready': False})
@@ -171,10 +166,8 @@ def movie_comments(request, movie_id):
     if request.method == 'GET':
         comments = movie.comments.order_by('-created_at')
         return Response([{
-            'id': c.id,
-            'author': c.author.username,
-            'content': c.content,
-            'created_at': c.created_at,
+            'id': c.id, 'author': c.author.username,
+            'content': c.content, 'created_at': c.created_at,
         } for c in comments])
 
     content = request.data.get('content')
@@ -182,8 +175,6 @@ def movie_comments(request, movie_id):
         return Response({'error': 'content required'}, status=400)
     comment = Comment.objects.create(movie=movie, author=request.user, content=content)
     return Response({
-        'id': comment.id,
-        'author': comment.author.username,
-        'content': comment.content,
-        'created_at': comment.created_at,
+        'id': comment.id, 'author': comment.author.username,
+        'content': comment.content, 'created_at': comment.created_at,
     }, status=201)

@@ -27,6 +27,9 @@ def user_detail(request, pk):
             'id': user.id,
             'username': user.username,
             'avatar': request.build_absolute_uri(user.avatar.url) if user.avatar else None,
+            'bio': user.bio,
+            'first_name': user.first_name,
+            'last_name': user.last_name,
         }
         if request.user.id == user.id:
             data['email'] = user.email

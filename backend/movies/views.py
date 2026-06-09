@@ -68,23 +68,75 @@ def stream_video(request, movie_id):
         f = get_playable_file(movie.folder)
         if f and os.path.exists(f):
             filepath = f
+
     if not filepath or not _file_is_playable(filepath):
         return Response({'error': 'Stream not ready'}, status=503)
 
+    ext = os.path.splitext(filepath)[1].lower()
+    needs_transcode = ext in ('.mkv', '.avi', '.mov', '.mpeg', '.mpg')
+
+    if needs_transcode:
+        return _stream_ffmpeg(filepath)
+    else:
+        return _stream_file(request, filepath)
+
+
+def _stream_file(request, filepath):
+    """Serve file directly with Range support — seek + duration work perfectly."""
+    size = os.path.getsize(filepath)
+    ext = os.path.splitext(filepath)[1].lower()
+    content_type = 'video/mp4' if ext == '.mp4' else 'video/webm' if ext == '.webm' else 'video/mp4'
+
+    range_header = request.META.get('HTTP_RANGE', '')
+    if range_header:
+        # Parse Range: bytes=start-end
+        try:
+            range_val = range_header.strip().replace('bytes=', '')
+            parts = range_val.split('-')
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if parts[1] else size - 1
+        except:
+            start, end = 0, size - 1
+    else:
+        start, end = 0, size - 1
+
+    end = min(end, size - 1)
+    length = end - start + 1
+    chunk_size = 1024 * 1024  # 1MB chunks
+
+    def file_iterator():
+        with open(filepath, 'rb') as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                read_size = min(chunk_size, remaining)
+                data = f.read(read_size)
+                if not data:
+                    break
+                yield data
+                remaining -= len(data)
+
+    status = 206 if range_header else 200
+    resp = StreamingHttpResponse(file_iterator(), status=status, content_type=content_type)
+    resp['Content-Length'] = str(length)
+    resp['Content-Range'] = f'bytes {start}-{end}/{size}'
+    resp['Accept-Ranges'] = 'bytes'
+    resp['Cache-Control'] = 'no-cache'
+    return resp
+
+
+def _stream_ffmpeg(filepath):
+    """For non-browser-native formats (mkv, avi...), transcode on the fly."""
     cmd = [
-        'ffmpeg',
-        '-i', filepath,
+        'ffmpeg', '-i', filepath,
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
         '-c:a', 'aac', '-ac', '2', '-b:a', '128k',
         '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
         '-frag_duration', '500000',
-        '-f', 'mp4',
-        '-loglevel', 'error',
-        'pipe:1',
+        '-f', 'mp4', '-loglevel', 'error', 'pipe:1',
     ]
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
 
-    # Pre-buffer the init segment so the browser receives a valid mp4 immediately
     buffered = bytearray()
     deadline = time.time() + 15
     while len(buffered) < 256 * 1024 and time.time() < deadline:

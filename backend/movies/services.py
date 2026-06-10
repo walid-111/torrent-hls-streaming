@@ -18,6 +18,7 @@ active_downloads = {}
 
 
 def _tmdb(title):
+    # Get rating and casting (will use them if not found in archive.org metadata)
     try:
         res = requests.get(
             'https://api.themoviedb.org/3/search/movie',
@@ -33,16 +34,24 @@ def _tmdb(title):
             params={'api_key': os.getenv('TMDB_API_KEY')},
             timeout=3
         ).json()
-        cast = [c['name'] for c in credits.get('cast', [])[:5]]
-        crew = credits.get('crew', [])
-        director = next((c['name'] for c in crew if c['job'] == 'Director'), None)
-        producer = next((c['name'] for c in crew if c['job'] == 'Producer'), None)
+        cast = []
+        for c in credits.get('cast', [])[:5]:
+            cast.append(c['name'])
+
+        director = None
+        producer = None
+        for c in credits.get('crew', []):
+            if c['job'] == 'Director':
+                director = c['name']
+            if c['job'] == 'Producer':
+                producer = c['name']
         return movie.get('vote_average'), {'director': director, 'producer': producer, 'cast': cast}
     except:
         return None, None
 
 
 def search_archive(query, page=1, min_year=None, min_rating=None):
+    # Search archive.org for movies, get metadata too
     if query:
         q = f"title:({query})+AND+mediatype:(movies)+AND+format:(MPEG4)"
     else:
@@ -84,6 +93,7 @@ def search_archive(query, page=1, min_year=None, min_rating=None):
 
 
 def search_publicdomain_torrents(query, page=1, min_year=None, min_rating=None):
+    # 2nd source, most of torrents have no seeders most of the time, scrap HTML to get torrent links cause no API
     base = "https://www.publicdomaintorrents.info"
     list_url = f"{base}/nshowcat.html?category=ALL"
 
@@ -160,7 +170,7 @@ def search_publicdomain_torrents(query, page=1, min_year=None, min_rating=None):
                 cover = f"https://image.tmdb.org/t/p/w500{tmdb_search[0]['poster_path']}"
         except:
             pass
-        
+
         results.append({
             'title': item['title'],
             'magnet': torrent_url,
@@ -176,6 +186,7 @@ def search_publicdomain_torrents(query, page=1, min_year=None, min_rating=None):
 
 
 def search_all(query, page=1, min_year=None, min_rating=None):
+    # Combine results from both sources
     if page > 20:
         return []
     results = search_archive(query, page, min_year, min_rating)
@@ -187,6 +198,7 @@ def search_all(query, page=1, min_year=None, min_rating=None):
 
 
 def _find_video(folder):
+    # Find videos in torrent folder, prio list
     preferred = ('.mp4', '.webm', '.mkv', '.avi', '.mov', '.mpeg', '.mpg')
     found = {}
     for root, _, files in os.walk(folder):
@@ -245,6 +257,7 @@ def start_download(torrent_url, movie_id):
 
     movie = Movie.objects.filter(id=movie_id).first()
     if movie and movie.file_path and not os.path.exists(movie.file_path):
+        # File was deleted but DB not updated, clear file_path to trigger redownload
         Movie.objects.filter(id=movie_id).update(file_path='')
         old = active_downloads.pop(torrent_url, None)
         if old:
@@ -259,6 +272,7 @@ def start_download(torrent_url, movie_id):
         print(f"Movie {movie_id}: failed to load torrent", flush=True)
         return
 
+    # Prioritize a video file in the torrent
     files = info.files()
     preferred = ['.mp4', '.webm', '.mkv', '.avi', '.mov']
     target = None
@@ -271,10 +285,12 @@ def start_download(torrent_url, movie_id):
             break
 
     if target is not None:
+        # For libtorrent, 7 is the highest priority, 0 is do not download
         priorities = [0] * info.num_files()
         priorities[target] = 7
-        handle.prioritize_files(priorities)
+        handle.prioritize_files(priorities) 
 
+        # Also prioritize pieces of that file to start streaming ASAP (start & end of file)
         file_offset = files.file_offset(target)
         file_size = files.file_size(target)
         piece_len = info.piece_length()
@@ -323,6 +339,7 @@ def start_download(torrent_url, movie_id):
 
 
 def get_playable_file(folder_name):
+    # Check if movie file already dled
     if not folder_name:
         return None
     folder = os.path.join(DOWNLOAD_PATH, folder_name)
@@ -345,6 +362,7 @@ def _srt_to_vtt(srt_text):
 
 
 def get_subtitle_text(identifier):
+    # Get subtitles from archive.org if available, convert to VTT
     if not identifier:
         return None
     url = f"https://archive.org/download/{identifier}/{identifier}.asr.srt"

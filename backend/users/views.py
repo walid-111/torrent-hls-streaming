@@ -10,7 +10,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from .models import User
-from .serializers import RegisterSerializer, UserSerializer
+from .serializers import RegisterSerializer, UserSerializer, password_error
 
 FRONTEND = 'http://localhost:3000'
 
@@ -226,6 +226,11 @@ def password_reset_confirm(request):
     if not default_token_generator.check_token(user, request.data.get('token')):
         return Response({'error': 'Expired token'}, status=400)
 
-    user.set_password(request.data.get('new_password'))
+    new_password = request.data.get('new_password')
+    error = password_error(new_password)
+    if error:
+        return Response({'error': error}, status=400)
+
+    user.set_password(new_password)
     user.save()
     return Response({'message': 'Password reset'})

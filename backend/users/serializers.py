@@ -2,6 +2,17 @@ from rest_framework import serializers
 from .models import User
 import re
 
+def password_error(value):
+    # same rules everywhere a password is set (register, reset, profile)
+    if not value or len(value) < 8:
+        return "Password must be at least 8 characters long"
+    if not re.search(r'[A-Z]', value):
+        return "Password must contain at least one uppercase letter"
+    if not re.search(r'[!@#$%^&*(),.?\":{}|<>]', value):
+        return "Password must contain at least one special character"
+    return None
+
+
 class RegisterSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, min_length=8)
 
@@ -10,12 +21,9 @@ class RegisterSerializer(serializers.ModelSerializer):
         fields = ['username', 'email', 'first_name', 'last_name', 'password']
 
     def validate_password(self, value):
-        if len(value) < 8:
-            raise serializers.ValidationError("Password must be at least 8 characters long")
-        if not re.search(r'[A-Z]', value):
-            raise serializers.ValidationError("Password must contain at least one uppercase letter")
-        if not re.search(r'[!@#$%^&*(),.?\":{}|<>]', value):
-            raise serializers.ValidationError("Password must contain at least one special character")
+        error = password_error(value)
+        if error:
+            raise serializers.ValidationError(error)
         return value
 
     def create(self, validated_data):

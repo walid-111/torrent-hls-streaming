@@ -3,7 +3,7 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from users.models import User
-from users.serializers import UserSerializer
+from users.serializers import UserSerializer, password_error
 from movies.models import Movie, Comment
 
 
@@ -41,6 +41,9 @@ def user_detail(request, pk):
     serializer = UserSerializer(user, data=request.data, partial=True)
     if serializer.is_valid():
         if 'password' in request.data:
+            error = password_error(request.data['password'])
+            if error:
+                return Response({'password': [error]}, status=400)
             user.set_password(request.data['password'])
             user.save()
         serializer.save()
@@ -110,7 +113,13 @@ def comment_detail(request, pk):
             'created_at': comment.created_at,
         })
 
+    # only the author can edit or delete a comment
+    if comment.author_id != request.user.id:
+        return Response({'error': 'Forbidden'}, status=403)
+
     if request.method == 'PATCH':
+        if not request.data.get('content', comment.content):
+            return Response({'error': 'content required'}, status=400)
         comment.content = request.data.get('content', comment.content)
         comment.save()
         return Response({

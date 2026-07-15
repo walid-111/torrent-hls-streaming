@@ -8,7 +8,8 @@ import subprocess
 import requests
 import re
 import libtorrent as lt
-from bs4 import BeautifulSoup
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
 
 DOWNLOAD_PATH = '/app/media/videos'
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
@@ -17,26 +18,27 @@ session = lt.session({'listen_interfaces': '0.0.0.0:6881', 'enable_dht': True})
 active_downloads = {}
 
 
+@lru_cache(maxsize=2000)
 def _tmdb(title):
-    # Get rating and casting (will use them if not found in archive.org metadata)
+    # rating (/10), cast, director and producer from TMDB, cached so we dont ask twice for the same title
+    key = os.getenv('TMDB_API_KEY')
+    if not key:
+        return None, None
     try:
-        res = requests.get(
+        results = requests.get(
             'https://api.themoviedb.org/3/search/movie',
-            params={'api_key': os.getenv('TMDB_API_KEY'), 'query': title},
+            params={'api_key': key, 'query': title},
             timeout=3
-        )
-        results = res.json().get('results', [])
+        ).json().get('results', [])
         if not results:
             return None, None
         movie = results[0]
         credits = requests.get(
             f"https://api.themoviedb.org/3/movie/{movie['id']}/credits",
-            params={'api_key': os.getenv('TMDB_API_KEY')},
+            params={'api_key': key},
             timeout=3
         ).json()
-        cast = []
-        for c in credits.get('cast', [])[:5]:
-            cast.append(c['name'])
+        cast = [c['name'] for c in credits.get('cast', [])[:5]]
 
         director = None
         producer = None
@@ -45,153 +47,64 @@ def _tmdb(title):
                 director = c['name']
             if c['job'] == 'Producer':
                 producer = c['name']
-        return movie.get('vote_average'), {'director': director, 'producer': producer, 'cast': cast}
-    except:
+        return movie.get('vote_average') or None, {'director': director, 'producer': producer, 'cast': cast}
+    except Exception:
         return None, None
 
 
 def search_archive(query, page=1, min_year=None, min_rating=None):
-    # Search archive.org for movies, get metadata too
+    # Search public domain feature films on archive.org (only mp4 so the browser can play most of them directly)
+    q = "collection:(feature_films) AND mediatype:(movies) AND format:(MPEG4)"
     if query:
-        q = f"title:({query})+AND+mediatype:(movies)+AND+format:(MPEG4)"
-    else:
-        q = "collection:(feature_films)+AND+mediatype:(movies)+AND+format:(MPEG4)"
+        q += f" AND title:({query})"
     if min_year:
-        q += f"+AND+year:[{min_year}+TO+9999]"
+        q += f" AND year:[{int(min_year)} TO 9999]"
 
-    url = (
-        f"https://archive.org/advancedsearch.php?q={q}"
-        f"&fl[]=identifier,title,year,avg_rating,description"
-        f"&sort[]=downloads+desc&output=json&rows=20&page={page}"
-    )
     try:
-        docs = requests.get(url, timeout=10).json().get('response', {}).get('docs', [])
-    except:
+        docs = requests.get('https://archive.org/advancedsearch.php', params={
+            'q': q,
+            'fl[]': ['identifier', 'title', 'year', 'avg_rating', 'description'],
+            'sort[]': 'downloads desc',
+            'output': 'json',
+            'rows': 20,
+            'page': page,
+        }, timeout=10).json().get('response', {}).get('docs', [])
+    except Exception:
         return []
 
+    # TMDB calls in parallel, doing them one by one made the search really slow
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        tmdb = list(pool.map(lambda d: _tmdb(d.get('title', '')), docs))
+
     results = []
-    for item in docs:
+    for item, (tmdb_rating, casting) in zip(docs, tmdb):
         ident = item.get('identifier')
-        title = item.get('title', '')
-        rating = item.get('avg_rating')
-        _, casting = _tmdb(title)
-        if not rating:
-            rating, _ = _tmdb(title)
+        # TMDB rating is /10, archive.org one is /5
+        rating = tmdb_rating
+        if not rating and item.get('avg_rating'):
+            rating = round(float(item['avg_rating']) * 2, 1)
         if min_rating and (not rating or float(rating) < float(min_rating)):
             continue
+        summary = item.get('description', '')
+        if isinstance(summary, list):
+            summary = ' '.join(summary)
         results.append({
-            'title': title,
+            'title': item.get('title', ''),
             'magnet': f"https://archive.org/download/{ident}/{ident}_archive.torrent",
             'cover': f"https://archive.org/services/img/{ident}",
             'year': item.get('year'),
             'rating': rating,
-            'summary': item.get('description', ''),
+            'summary': summary,
             'casting': casting,
             'source': 'archive.org',
         })
     return results
 
 
-def search_publicdomain_torrents(query, page=1, min_year=None, min_rating=None):
-    # 2nd source, most of torrents have no seeders most of the time, scrap HTML to get torrent links cause no API
-    base = "https://www.publicdomaintorrents.info"
-    list_url = f"{base}/nshowcat.html?category=ALL"
-
-    try:
-        html = requests.get(list_url, timeout=5).text
-    except Exception:
-        return []
-
-    soup = BeautifulSoup(html, 'html.parser')
-
-    links = []
-    for a in soup.find_all('a', href=True):
-        href = a['href']
-        if 'nshowmovie.html' in href:
-            title = a.get_text(strip=True)
-            if not title:
-                continue
-            if query and query.lower() not in title.lower():
-                continue
-            links.append({
-                'title': title,
-                'url': href if href.startswith('http') else base + '/' + href.lstrip('/'),
-            })
-
-    if not links:
-        return []
-
-    per_page = 5
-    start = (page - 1) * per_page
-    subset = links[start:start + per_page]
-
-    results = []
-    for item in subset:
-        try:
-            detail_html = requests.get(item['url'], timeout=5).text
-        except Exception:
-            continue
-
-        detail = BeautifulSoup(detail_html, 'html.parser')
-
-        torrent_url = None
-        for a in detail.find_all('a', href=True):
-            href = a['href']
-            if href.lower().endswith('.torrent'):
-                torrent_url = href if href.startswith('http') else base + '/' + href.lstrip('/')
-                break
-        if not torrent_url:
-            continue
-
-        summary = ''
-        paras = detail.find_all('p')
-        if paras:
-            summary = paras[0].get_text(strip=True)
-
-        year = None
-        m = re.search(r'\b(19\d{2}|20\d{2})\b', item['title'])
-        if m:
-            year = m.group(1)
-
-        rating, casting = _tmdb(item['title'])
-        if min_rating and (not rating or float(rating) < float(min_rating)):
-            continue
-        if min_year and year and int(year) < int(min_year):
-            continue
-        
-        cover = ''
-        try:
-            tmdb_search = requests.get(
-                'https://api.themoviedb.org/3/search/movie',
-                params={'api_key': os.getenv('TMDB_API_KEY'), 'query': item['title']},
-                timeout=3
-            ).json().get('results', [])
-            if tmdb_search and tmdb_search[0].get('poster_path'):
-                cover = f"https://image.tmdb.org/t/p/w500{tmdb_search[0]['poster_path']}"
-        except:
-            pass
-
-        results.append({
-            'title': item['title'],
-            'magnet': torrent_url,
-            'cover': cover,
-            'year': year,
-            'rating': rating,
-            'summary': summary,
-            'casting': casting,
-            'source': 'publicdomaintorrents',
-        })
-
-    return results
-
-
 def search_all(query, page=1, min_year=None, min_rating=None):
-    # Combine results from both sources
     if page > 20:
         return []
     results = search_archive(query, page, min_year, min_rating)
-    if page <= 3:
-        results += search_publicdomain_torrents(query, page, min_year, min_rating)
     if query:
         results.sort(key=lambda r: r['title'].lower())
     return results

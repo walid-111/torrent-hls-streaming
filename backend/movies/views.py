@@ -9,22 +9,10 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from .models import Movie, Comment
-from .services import search_all, start_download, get_playable_file, get_subtitle_text
+from .services import search_all, start_download, get_download, get_subtitle_text
 
 
 BUFF_SIZE = 10 * 1024 * 1024
-
-
-def _file_is_playable(filepath):
-    try:
-        r = subprocess.run(
-            ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_name',
-             '-of', 'csv=p=0', filepath],
-            capture_output=True, timeout=10
-        )
-        return r.returncode == 0 and bool(r.stdout.strip())
-    except Exception:
-        return False
 
 
 def _get_range(request):
@@ -98,34 +86,42 @@ def _stream_ffmpeg(filepath):
     return resp
 
 
-def _serve_file(filepath, start, end=None):
-    file_size_on_disk = os.path.getsize(filepath)
+def _wait_for_range(dl, start, end, timeout=60):
+    # block until these bytes are really downloaded (sparse file = zeros where pieces are missing)
+    if dl is None:
+        return True
+    dl.want_range(start, end)
+    deadline = time.time() + timeout
+    while not dl.has_range(start, end):
+        if dl.dead or time.time() > deadline:
+            return False
+        time.sleep(0.2)
+    return True
 
-    if start >= file_size_on_disk:
-        deadline = time.time() + 30
-        while time.time() < deadline:
-            file_size_on_disk = os.path.getsize(filepath)
-            if start < file_size_on_disk:
-                break
-            time.sleep(1)
-        else:
-            start = 0
-            file_size_on_disk = os.path.getsize(filepath)
 
+def _serve_file(filepath, size, dl, start, end=None):
+    if start >= size:
+        resp = HttpResponse(status=416)
+        resp['Content-Range'] = f'bytes */{size}'
+        return resp
     if end is None:
         end = start + BUFF_SIZE - 1
-    end = min(end, file_size_on_disk - 1, start + BUFF_SIZE - 1)
-    length = end - start + 1
+    end = min(end, size - 1, start + BUFF_SIZE - 1)
 
+    if not _wait_for_range(dl, start, end):
+        return Response({'error': 'Stream not ready'}, status=503)
+
+    length = end - start + 1
     with open(filepath, 'rb') as f:
         f.seek(start)
         data = f.read(length)
 
     resp = HttpResponse(data, status=206, content_type=mimetypes.guess_type(filepath)[0] or 'video/mp4')
-    resp['Content-Range'] = f'bytes {start}-{end}/{file_size_on_disk}'
+    resp['Content-Range'] = f'bytes {start}-{end}/{size}'
     resp['Accept-Ranges'] = 'bytes'
     resp['Content-Length'] = str(length)
     return resp
+
 
 def _is_h264(filepath):
     try:
@@ -178,39 +174,16 @@ def stream_video(request, movie_id):
     except Movie.DoesNotExist:
         return Response({'error': 'Not found'}, status=404)
 
-    filepath = None
-    if movie.file_path and os.path.exists(movie.file_path):
-        filepath = movie.file_path
-    else:
-        f = get_playable_file(movie.folder)
-        if f and os.path.exists(f):
-            filepath = f
-
-    if not filepath or not _file_is_playable(filepath):
+    filepath, size, dl = get_download(movie)
+    if not filepath:
         return Response({'error': 'Stream not ready'}, status=503)
 
     ext = os.path.splitext(filepath)[1].lower()
-    if ext in ('.mkv', '.avi', '.mov', '.mpeg', '.mpg') or not _is_h264(filepath):
+    if dl is None and (ext in ('.mkv', '.avi', '.mov', '.mpeg', '.mpg') or not _is_h264(filepath)):
         return _stream_ffmpeg(filepath)
 
     start, end = _get_range(request)
-    return _serve_file(filepath, start, end)
-
-
-def _ffmpeg_can_stream(filepath):
-    try:
-        r = subprocess.run(
-            [
-                'ffmpeg', '-v', 'error',
-                '-i', filepath,
-                '-frames:v', '1',
-                '-f', 'null', '-'
-            ],
-            capture_output=True, timeout=15
-        )
-        return r.returncode == 0
-    except Exception:
-        return False
+    return _serve_file(filepath, size, dl, start, end)
 
 
 @api_view(['GET'])
@@ -221,23 +194,14 @@ def movie_status(request, movie_id):
     except Movie.DoesNotExist:
         return Response({'ready': False})
 
-    filepath = None
-    if movie.file_path and os.path.exists(movie.file_path):
-        filepath = movie.file_path
-    else:
-        f = get_playable_file(movie.folder)
-        if f and os.path.exists(f):
-            filepath = f
-
-    if not filepath or not _file_is_playable(filepath):
+    filepath, size, dl = get_download(movie)
+    if not filepath:
         return Response({'ready': False})
-
-    if os.path.getsize(filepath) < 50 * 1024 * 1024:
+    if dl and dl.dead:
+        return Response({'ready': False, 'failed': True})
+    # ready when the first few MB and the end of the file (mp4 index) are downloaded
+    if dl and not (dl.has_range(0, min(size, 5 * 1024 * 1024) - 1) and dl.has_range(max(0, size - 4 * 1024 * 1024), size - 1)):
         return Response({'ready': False})
-
-    if not _ffmpeg_can_stream(filepath):
-        return Response({'ready': False})
-
     return Response({'ready': True})
 
 

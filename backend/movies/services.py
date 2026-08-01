@@ -15,7 +15,6 @@ DOWNLOAD_PATH = '/app/media/videos'
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 
 session = lt.session({'listen_interfaces': '0.0.0.0:6881', 'enable_dht': True})
-active_downloads = {}
 
 
 @lru_cache(maxsize=2000)
@@ -110,23 +109,6 @@ def search_all(query, page=1, min_year=None, min_rating=None):
     return results
 
 
-def _find_video(folder):
-    # Find videos in torrent folder, prio list
-    preferred = ('.mp4', '.webm', '.mkv', '.avi', '.mov', '.mpeg', '.mpg')
-    found = {}
-    for root, _, files in os.walk(folder):
-        for f in files:
-            ext = os.path.splitext(f)[1].lower()
-            if ext in preferred:
-                full = os.path.join(root, f)
-                if ext not in found or os.path.getsize(full) > os.path.getsize(found[ext]):
-                    found[ext] = full
-    for ext in preferred:
-        if ext in found:
-            return found[ext]
-    return None
-
-
 def _get_duration(filepath):
     try:
         r = subprocess.run(
@@ -140,125 +122,159 @@ def _get_duration(filepath):
 
 
 def _load_torrent_info(torrent_url):
+    params = lt.add_torrent_params()
     if torrent_url.startswith('magnet:'):
         params = lt.parse_magnet_uri(torrent_url)
-        params.save_path = DOWNLOAD_PATH
-        handle = session.add_torrent(params)
-        for _ in range(30):
-            if handle.status().has_metadata:
-                return handle, handle.torrent_file()
-            time.sleep(1)
-        try: session.remove_torrent(handle)
-        except: pass
-        return None, None
+    else:
+        try:
+            data = requests.get(torrent_url, timeout=10).content
+            params.ti = lt.torrent_info(lt.bdecode(data))
+        except Exception:
+            return None, None
 
-    try:
-        data = requests.get(torrent_url, timeout=10).content
-        info = lt.torrent_info(lt.bdecode(data))
-        handle = session.add_torrent({
-            'ti': info,
-            'save_path': DOWNLOAD_PATH,
-            'storage_mode': lt.storage_mode_t.storage_mode_sparse,
-        })
-        return handle, info
-    except:
-        return None, None
+    params.save_path = DOWNLOAD_PATH
+    params.storage_mode = lt.storage_mode_t.storage_mode_sparse
+    # download pieces in order, so the start of the movie is ready first
+    params.flags |= lt.torrent_flags.sequential_download
+    handle = session.add_torrent(params)
+
+    # magnet links need to fetch the metadata from peers first
+    for _ in range(30):
+        if handle.status().has_metadata:
+            return handle, handle.torrent_file()
+        time.sleep(1)
+    try: session.remove_torrent(handle)
+    except: pass
+    return None, None
+
+
+class Download:
+    """
+    One movie being downloaded. Keeps which file of the torrent is the video,
+    so we can tell which bytes of that file are really on disk.
+    (files are sparse: the file size on disk means nothing, missing parts are just zeros)
+    """
+
+    def __init__(self, handle, info, file_index):
+        self.handle = handle
+        self.info = info
+        files = info.files()
+        self.offset = files.file_offset(file_index)
+        self.size = files.file_size(file_index)
+        self.path = os.path.join(DOWNLOAD_PATH, files.file_path(file_index))
+        self.piece_len = info.piece_length()
+        self.dead = False
+        self.done = False
+
+    def _pieces(self, start, end):
+        # pieces of the torrent covering bytes [start, end] of the video file
+        first = (self.offset + start) // self.piece_len
+        last = (self.offset + min(end, self.size - 1)) // self.piece_len
+        return range(first, last + 1)
+
+    def has_range(self, start, end):
+        if self.done:
+            return True
+        return all(self.handle.have_piece(p) for p in self._pieces(start, end))
+
+    def want_range(self, start, end):
+        # ask libtorrent to get these pieces first (used when ffmpeg jumps somewhere, like the moov atom at the end)
+        for i, p in enumerate(self._pieces(start, end)):
+            if not self.handle.have_piece(p):
+                self.handle.set_piece_deadline(p, 500 + i * 100)
+
+
+downloads = {}  # movie_id -> Download
+
+
+def _pick_video_file(info):
+    files = info.files()
+    for ext in ['.mp4', '.webm', '.mkv', '.avi', '.mov', '.mpeg', '.mpg']:
+        best = None
+        for i in range(info.num_files()):
+            if files.file_path(i).lower().endswith(ext):
+                if best is None or files.file_size(i) > files.file_size(best):
+                    best = i
+        if best is not None:
+            return best
+    return None
 
 
 def start_download(torrent_url, movie_id):
     from .models import Movie
 
     movie = Movie.objects.filter(id=movie_id).first()
-    if movie and movie.file_path and not os.path.exists(movie.file_path):
-        # File was deleted but DB not updated, clear file_path to trigger redownload
-        Movie.objects.filter(id=movie_id).update(file_path='')
-        old = active_downloads.pop(torrent_url, None)
-        if old:
-            try: session.remove_torrent(old)
-            except: pass
+    if movie and movie.file_path and os.path.exists(movie.file_path):
+        return  # already fully downloaded
 
-    if torrent_url in active_downloads:
+    current = downloads.get(movie_id)
+    if current and not current.dead:
         return
+    if current:
+        try: session.remove_torrent(current.handle)
+        except: pass
+        downloads.pop(movie_id, None)
 
     handle, info = _load_torrent_info(torrent_url)
     if not handle or not info:
         print(f"Movie {movie_id}: failed to load torrent", flush=True)
         return
 
-    # Prioritize a video file in the torrent
-    files = info.files()
-    preferred = ['.mp4', '.webm', '.mkv', '.avi', '.mov']
-    target = None
-    for ext in preferred:
-        for i in range(info.num_files()):
-            if files.file_path(i).lower().endswith(ext):
-                if target is None or files.file_size(i) > files.file_size(target):
-                    target = i
-        if target is not None:
-            break
+    target = _pick_video_file(info)
+    if target is None:
+        print(f"Movie {movie_id}: no video file in torrent", flush=True)
+        try: session.remove_torrent(handle)
+        except: pass
+        return
 
-    if target is not None:
-        # For libtorrent, 7 is the highest priority, 0 is do not download
-        priorities = [0] * info.num_files()
-        priorities[target] = 7
-        handle.prioritize_files(priorities) 
+    # only download the video file (0 = skip). normal priority (4) on purpose:
+    # with 7 libtorrent stops downloading in order, pieces come randomly
+    priorities = [0] * info.num_files()
+    priorities[target] = 4
+    handle.prioritize_files(priorities)
 
-        # Also prioritize pieces of that file to start streaming ASAP (start & end of file)
-        file_offset = files.file_offset(target)
-        file_size = files.file_size(target)
-        piece_len = info.piece_length()
-        first_piece = file_offset // piece_len
-        last_piece = (file_offset + file_size - 1) // piece_len
-        for p in range(first_piece, min(first_piece + 5, last_piece + 1)):
-            handle.piece_priority(p, 7)
-        for p in range(max(last_piece - 9, first_piece), last_piece + 1):
-            handle.piece_priority(p, 7)
-
-    active_downloads[torrent_url] = handle
+    dl = Download(handle, info, target)
+    # start of the file first for playback, and the end because a lot of mp4 have their index (moov atom) there
+    dl.want_range(0, 4 * 1024 * 1024)
+    dl.want_range(max(0, dl.size - 4 * 1024 * 1024), dl.size - 1)
+    downloads[movie_id] = dl
     Movie.objects.filter(id=movie_id).update(folder=info.name())
 
     def monitor():
-        from .models import Movie
         from django.utils import timezone
         stuck_seconds = 0
-        last_progress = handle.status().progress
-        while handle.status().progress < 0.999:
+        last_done = 0
+        while True:
             s = handle.status()
-            print(f"Movie {movie_id}: {s.progress*100:.1f}% ({s.download_rate/1000:.0f} kB/s)", flush=True)
-            if s.progress <= last_progress + 0.001 and s.download_rate < 1000:
-                stuck_seconds += 3
-            else:
-                stuck_seconds = 0
-                last_progress = s.progress
-            if stuck_seconds >= 60 and s.progress >= 0.90:
-                print(f"Movie {movie_id}: stuck at {s.progress*100:.1f}%, marking complete", flush=True)
+            done = handle.file_progress()[target]
+            if done >= dl.size:
                 break
-            if stuck_seconds >= 180:
-                print(f"Movie {movie_id}: dead torrent", flush=True)
-                active_downloads.pop(torrent_url, None)
-                try: session.remove_torrent(handle)
-                except: pass
+            print(f"Movie {movie_id}: {done * 100 / dl.size:.1f}% ({s.download_rate / 1000:.0f} kB/s, {s.num_peers} peers)", flush=True)
+            stuck_seconds = stuck_seconds + 3 if done == last_done else 0
+            last_done = done
+            if stuck_seconds >= 120:
+                print(f"Movie {movie_id}: nothing downloaded for 2 min, dead torrent", flush=True)
+                dl.dead = True
                 return
             time.sleep(3)
 
-        path = _find_video(os.path.join(DOWNLOAD_PATH, info.name()))
-        if path:
-            Movie.objects.filter(id=movie_id).update(
-                file_path=path, length=_get_duration(path), last_watched=timezone.now()
-            )
+        dl.done = True
+        Movie.objects.filter(id=movie_id).update(
+            file_path=dl.path, length=_get_duration(dl.path), last_watched=timezone.now()
+        )
         print(f"Movie {movie_id}: complete", flush=True)
 
     threading.Thread(target=monitor, daemon=True).start()
 
 
-def get_playable_file(folder_name):
-    # Check if movie file already dled
-    if not folder_name:
-        return None
-    folder = os.path.join(DOWNLOAD_PATH, folder_name)
-    if not os.path.exists(folder):
-        return None
-    return _find_video(folder)
+def get_download(movie):
+    """Returns (path, size, download or None). download is None when the file is already complete on disk."""
+    if movie.file_path and os.path.exists(movie.file_path):
+        return movie.file_path, os.path.getsize(movie.file_path), None
+    dl = downloads.get(movie.id)
+    if dl:
+        return dl.path, dl.size, dl
+    return None, None, None
 
 
 def _srt_to_vtt(srt_text):

@@ -120,7 +120,10 @@ function MovieContent() {
     const interval = setInterval(() => {
       fetch(`http://localhost:8000/internal/movies/status/${movieId}/`, { credentials: 'include' })
         .then(r => r.json())
-        .then(data => { if (data.ready) { setStreamReady(true); clearInterval(interval) } })
+        .then(data => {
+          if (data.ready) { setStreamReady(true); clearInterval(interval) }
+          if (data.failed) { setNoSeeders(true); clearInterval(interval) }
+        })
         .catch(() => {})
     }, 2000)
     return () => clearInterval(interval)

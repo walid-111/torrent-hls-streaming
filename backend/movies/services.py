@@ -9,6 +9,7 @@ import requests
 import re
 import libtorrent as lt
 from functools import lru_cache
+from urllib.parse import quote
 from concurrent.futures import ThreadPoolExecutor
 
 DOWNLOAD_PATH = '/app/media/videos'
@@ -159,12 +160,21 @@ class Download:
         self.handle = handle
         self.info = info
         files = info.files()
+        self.index = file_index
         self.offset = files.file_offset(file_index)
         self.size = files.file_size(file_index)
         self.path = os.path.join(DOWNLOAD_PATH, files.file_path(file_index))
         self.piece_len = info.piece_length()
         self.dead = False
         self.done = False
+        # http urls of the video file from the torrent web seeds (archive.org torrents always have some)
+        self.http_urls = []
+        for seed in info.web_seeds():
+            base = seed['url']
+            if base.endswith('/'):
+                self.http_urls.append(base + quote(files.file_path(file_index)))
+            elif info.num_files() == 1:
+                self.http_urls.append(base)
 
     def _pieces(self, start, end):
         # pieces of the torrent covering bytes [start, end] of the video file
@@ -176,6 +186,27 @@ class Download:
         if self.done:
             return True
         return all(self.handle.have_piece(p) for p in self._pieces(start, end))
+
+    def downloaded_until(self):
+        # how many bytes from the start of the file are downloaded without a hole
+        if self.done:
+            return self.size
+        p = (self.offset // self.piece_len)
+        while p < self.info.num_pieces() and self.handle.have_piece(p):
+            p += 1
+        return max(0, min(self.size, (p * self.piece_len) - self.offset))
+
+    def fetch_http(self, start, end):
+        # web seeds always download in order, so a range far ahead (like the mp4 index at the end)
+        # would only arrive at the very end. for those, ask the web seed directly over http.
+        for url in self.http_urls:
+            try:
+                r = requests.get(url, headers={'Range': f'bytes={start}-{end}'}, timeout=15)
+                if r.status_code == 206 and len(r.content) == end - start + 1:
+                    return r.content
+            except Exception:
+                pass
+        return None
 
     def want_range(self, start, end):
         # ask libtorrent to get these pieces first (used when ffmpeg jumps somewhere, like the moov atom at the end)
@@ -246,7 +277,7 @@ def start_download(torrent_url, movie_id):
         last_done = 0
         while True:
             s = handle.status()
-            done = handle.file_progress()[target]
+            done = handle.file_progress()[dl.index]
             if done >= dl.size:
                 break
             print(f"Movie {movie_id}: {done * 100 / dl.size:.1f}% ({s.download_rate / 1000:.0f} kB/s, {s.num_peers} peers)", flush=True)

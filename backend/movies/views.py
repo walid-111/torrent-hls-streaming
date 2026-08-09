@@ -1,18 +1,14 @@
 import os
 import re
 import time
-import mimetypes
-import subprocess
-from django.http import HttpResponse, StreamingHttpResponse
+from django.http import HttpResponse, FileResponse, StreamingHttpResponse
 from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from .models import Movie, Comment
+from . import hls
 from .services import search_all, start_download, get_download, get_subtitle_text
-
-
-BUFF_SIZE = 10 * 1024 * 1024
 
 
 def _get_range(request):
@@ -23,67 +19,6 @@ def _get_range(request):
         end = int(m.group('end')) if m.group('end') else None
         return start, end
     return 0, None
-
-
-def _stream_ffmpeg(filepath):
-    cmd = [
-        'ffmpeg', '-re',
-        '-i', filepath,
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
-        '-c:a', 'aac', '-ac', '2', '-b:a', '128k',
-        '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
-        '-frag_duration', '2000000',
-        '-f', 'mp4', '-loglevel', 'error',
-        'pipe:1',
-    ]
-    process = subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
-    )
-
-    buffered = bytearray()
-    deadline = time.time() + 30
-    found_ftyp = False
-
-    while time.time() < deadline:
-        chunk = process.stdout.read(4096)
-        if not chunk:
-            if process.poll() is not None:
-                err = process.stderr.read().decode('utf-8', errors='replace')
-                print(f"ffmpeg pipe died: {err}", flush=True)
-                break
-            time.sleep(0.05)
-            continue
-        buffered.extend(chunk)
-
-        if not found_ftyp and len(buffered) >= 8:
-            if b'ftyp' in buffered[:16]:
-                found_ftyp = True
-
-        if found_ftyp and len(buffered) >= 65536:
-            break
-
-    if not found_ftyp or len(buffered) < 1024:
-        try: process.kill()
-        except: pass
-        return Response({'error': 'Stream not ready'}, status=503)
-
-    def stream():
-        try:
-            yield bytes(buffered)
-            while True:
-                chunk = process.stdout.read(65536)
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            try: process.kill()
-            except: pass
-
-    resp = StreamingHttpResponse(stream(), content_type='video/mp4')
-    resp['Accept-Ranges'] = 'none'
-    resp['Cache-Control'] = 'no-cache'
-    resp['X-Content-Type-Options'] = 'nosniff'
-    return resp
 
 
 def _wait_for_range(dl, start, end, timeout=60):
@@ -97,44 +32,6 @@ def _wait_for_range(dl, start, end, timeout=60):
             return False
         time.sleep(0.2)
     return True
-
-
-def _serve_file(filepath, size, dl, start, end=None):
-    if start >= size:
-        resp = HttpResponse(status=416)
-        resp['Content-Range'] = f'bytes */{size}'
-        return resp
-    if end is None:
-        end = start + BUFF_SIZE - 1
-    end = min(end, size - 1, start + BUFF_SIZE - 1)
-
-    if not _wait_for_range(dl, start, end):
-        return Response({'error': 'Stream not ready'}, status=503)
-
-    length = end - start + 1
-    with open(filepath, 'rb') as f:
-        f.seek(start)
-        data = f.read(length)
-
-    resp = HttpResponse(data, status=206, content_type=mimetypes.guess_type(filepath)[0] or 'video/mp4')
-    resp['Content-Range'] = f'bytes {start}-{end}/{size}'
-    resp['Accept-Ranges'] = 'bytes'
-    resp['Content-Length'] = str(length)
-    return resp
-
-
-def _is_h264(filepath):
-    try:
-        r = subprocess.run(
-            ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
-             '-show_entries', 'stream=codec_name',
-             '-of', 'csv=p=0', filepath],
-            capture_output=True, timeout=10
-        )
-        codec = r.stdout.decode().strip().lower()
-        return codec in ('h264', 'hevc', 'h265', 'vp8', 'vp9', 'av1')
-    except:
-        return False
 
 
 @api_view(['GET'])
@@ -162,13 +59,18 @@ def start_stream(request):
     movie.watched_by.add(request.user)
     movie.last_watched = timezone.now()
     movie.save()
+    if hls.has_failed(movie.id):
+        hls.remove(movie.id)  # try again from scratch
     start_download(magnet, movie.id)
     return Response({'movie_id': movie.id})
 
 
 @api_view(['GET'])
-@permission_classes([IsAuthenticated])
-def stream_video(request, movie_id):
+@permission_classes([AllowAny])
+def raw_video(request, movie_id):
+    # only for our own ffmpeg (signed token), gives the video bytes once they are downloaded
+    if not hls.check_raw_token(request.GET.get('token', ''), movie_id):
+        return Response({'error': 'Forbidden'}, status=403)
     try:
         movie = Movie.objects.get(id=movie_id)
     except Movie.DoesNotExist:
@@ -176,14 +78,54 @@ def stream_video(request, movie_id):
 
     filepath, size, dl = get_download(movie)
     if not filepath:
-        return Response({'error': 'Stream not ready'}, status=503)
-
-    ext = os.path.splitext(filepath)[1].lower()
-    if dl is None and (ext in ('.mkv', '.avi', '.mov', '.mpeg', '.mpg') or not _is_h264(filepath)):
-        return _stream_ffmpeg(filepath)
-
+        return Response({'error': 'Not downloading'}, status=503)
     start, end = _get_range(request)
-    return _serve_file(filepath, size, dl, start, end)
+    if start >= size:
+        resp = HttpResponse(status=416)
+        resp['Content-Range'] = f'bytes */{size}'
+        return resp
+    end = size - 1 if end is None else min(end, size - 1)
+
+    def chunks():
+        # send the range piece by piece, waiting for each part to be downloaded
+        # (ffmpeg takes a short answer as the end of the file, so we cant just send what we have)
+        pos = start
+        while pos <= end:
+            stop = min(pos + 256 * 1024, end + 1)
+            data = None
+            # far ahead of the download (ex: mp4 index at the end of the file): get it over http right away
+            if dl and not dl.has_range(pos, stop - 1) and pos > dl.downloaded_until() + 4 * 1024 * 1024:
+                data = dl.fetch_http(pos, stop - 1)
+            if data is None:
+                if not _wait_for_range(dl, pos, stop - 1, timeout=600):
+                    return
+                with open(filepath, 'rb') as f:
+                    f.seek(pos)
+                    data = f.read(stop - pos)
+            yield data
+            pos = stop
+
+    resp = StreamingHttpResponse(chunks(), status=206, content_type='video/mp4')
+    resp['Content-Range'] = f'bytes {start}-{end}/{size}'
+    resp['Content-Length'] = str(end - start + 1)
+    resp['Accept-Ranges'] = 'bytes'
+    return resp
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def hls_file(request, movie_id, name):
+    if not hls.FILE_RE.match(name):
+        return Response({'error': 'Not found'}, status=404)
+    path = os.path.join(hls.folder(movie_id), name)
+    if not os.path.exists(path):
+        return Response({'error': 'Not found'}, status=404)
+    if name.endswith('.m3u8'):
+        resp = FileResponse(open(path, 'rb'), content_type='application/vnd.apple.mpegurl')
+        resp['Cache-Control'] = 'no-cache'  # playlist changes while ffmpeg runs
+    else:
+        resp = FileResponse(open(path, 'rb'), content_type='video/mp2t')
+    return resp
 
 
 @api_view(['GET'])
@@ -195,14 +137,18 @@ def movie_status(request, movie_id):
         return Response({'ready': False})
 
     filepath, size, dl = get_download(movie)
-    if not filepath:
+    if not filepath and not hls.is_complete(movie_id):
         return Response({'ready': False})
-    if dl and dl.dead:
+    if (dl and dl.dead) or hls.has_failed(movie_id):
         return Response({'ready': False, 'failed': True})
-    # ready when the first few MB and the end of the file (mp4 index) are downloaded
-    if dl and not (dl.has_range(0, min(size, 5 * 1024 * 1024) - 1) and dl.has_range(max(0, size - 4 * 1024 * 1024), size - 1)):
-        return Response({'ready': False})
-    return Response({'ready': True})
+
+    hls.start(movie_id)
+    # 2 segments = enough buffer to start playing
+    ready = hls.is_complete(movie_id) or hls.segment_count(movie_id) >= 2
+    progress = None
+    if dl and not dl.done:
+        progress = round(dl.handle.file_progress()[dl.index] * 100 / dl.size)
+    return Response({'ready': ready, 'progress': progress})
 
 
 @api_view(['GET'])

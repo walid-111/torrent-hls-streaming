@@ -2,60 +2,38 @@
 import { useState, useEffect, useRef, Suspense } from 'react'
 import { useSearchParams, useRouter } from 'next/navigation'
 import { useAuth } from '../components/useAuth'
+import Hls from 'hls.js'
+
+const API = 'http://localhost:8000'
 
 function VideoPlayer({ movieId, subtitles }: { movieId: number, subtitles: any[] }) {
   const videoRef = useRef<HTMLVideoElement>(null)
-  const retryRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const reloadingRef = useRef(false)
-
-  function reload() {
-    const video = videoRef.current
-    if (!video || reloadingRef.current) return
-    reloadingRef.current = true
-    video.pause()
-    const src = video.querySelector('source') as HTMLSourceElement
-    if (!src) { reloadingRef.current = false; return }
-    const orig = src.src
-    src.src = ''
-    setTimeout(() => {
-      if (!videoRef.current) { reloadingRef.current = false; return }
-      src.src = orig
-      videoRef.current.load()
-      videoRef.current.currentTime = 0
-      videoRef.current.play().catch(() => {})
-      reloadingRef.current = false
-    }, 3000)
-  }
 
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
-    reloadingRef.current = false
+    const url = `${API}/internal/movies/hls/${movieId}/index.m3u8`
 
-    function onError() {
-      if (reloadingRef.current) return
-      if (!video) return
-      const src = video.querySelector('source') as HTMLSourceElement
-      if (!src || !src.src || src.src === window.location.href) return
-      if (retryRef.current) clearTimeout(retryRef.current)
-      retryRef.current = setTimeout(reload, 2000)
-    }
-
-    video.addEventListener('error', onError)
-    const source = video.querySelector('source')
-    if (source) source.addEventListener('error', onError)
-
-    return () => {
-      video.removeEventListener('error', onError)
-      const s = video.querySelector('source')
-      if (s) s.removeEventListener('error', onError)
-      if (retryRef.current) clearTimeout(retryRef.current)
+    // chrome/firefox: hls.js. safari plays hls natively
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        xhrSetup: xhr => { xhr.withCredentials = true }, // send the session cookie
+      })
+      hls.loadSource(url)
+      hls.attachMedia(video)
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        // segment not there yet or network hiccup: try again instead of dying
+        if (data.fatal && data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad()
+        else if (data.fatal && data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError()
+      })
+      return () => hls.destroy()
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = url
     }
   }, [movieId])
 
   return (
-    <video ref={videoRef} key={movieId} className="w-full rounded mb-6 card" controls preload="metadata">
-      <source src={`http://localhost:8000/internal/movies/stream/${movieId}/`} type="video/mp4" />
+    <video ref={videoRef} key={movieId} className="w-full rounded mb-6 card" controls autoPlay crossOrigin="use-credentials">
       {subtitles.map((s, i) => (
         <track key={i} kind="subtitles" src={s.url} srcLang={s.lang}
           label={s.lang === 'en' ? 'English' : s.lang} default={s.lang === 'en'} />
@@ -82,6 +60,7 @@ function MovieContent() {
 
   const [movieId, setMovieId] = useState<number | null>(null)
   const [streamReady, setStreamReady] = useState(false)
+  const [progress, setProgress] = useState<number | null>(null)
   const [noSeeders, setNoSeeders] = useState(false)
   const [comments, setComments] = useState<any[]>([])
   const [comment, setComment] = useState('')
@@ -95,7 +74,7 @@ function MovieContent() {
   useEffect(() => {
     if (!ready || !magnet || startedRef.current) return
     startedRef.current = true
-    fetch('http://localhost:8000/internal/movies/start/', {
+    fetch(`${API}/internal/movies/start/`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCsrf() },
       credentials: 'include',
@@ -118,9 +97,10 @@ function MovieContent() {
   useEffect(() => {
     if (!movieId || streamReady) return
     const interval = setInterval(() => {
-      fetch(`http://localhost:8000/internal/movies/status/${movieId}/`, { credentials: 'include' })
+      fetch(`${API}/internal/movies/status/${movieId}/`, { credentials: 'include' })
         .then(r => r.json())
         .then(data => {
+          if (data.progress != null) setProgress(data.progress)
           if (data.ready) { setStreamReady(true); clearInterval(interval) }
           if (data.failed) { setNoSeeders(true); clearInterval(interval) }
         })
@@ -130,12 +110,12 @@ function MovieContent() {
   }, [movieId, streamReady])
 
   function loadComments(id: number) {
-    fetch(`http://localhost:8000/internal/movies/${id}/comments/`, { credentials: 'include' })
+    fetch(`${API}/internal/movies/${id}/comments/`, { credentials: 'include' })
       .then(r => r.json()).then(setComments).catch(() => {})
   }
 
   function loadSubtitles(id: number) {
-    fetch(`http://localhost:8000/internal/movies/${id}/subtitles/`, { credentials: 'include' })
+    fetch(`${API}/internal/movies/${id}/subtitles/`, { credentials: 'include' })
       .then(r => r.json())
       .then(data => {
         const list = (data.subtitles || []).map((s: any) => {
@@ -150,7 +130,7 @@ function MovieContent() {
   async function postComment(e: React.SyntheticEvent) {
     e.preventDefault()
     if (!movieId || !comment.trim()) return
-    await fetch(`http://localhost:8000/internal/movies/${movieId}/comments/`, {
+    await fetch(`${API}/internal/movies/${movieId}/comments/`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCsrf() },
       credentials: 'include',
@@ -198,7 +178,7 @@ function MovieContent() {
       {!noSeeders && !streamReady && movieId && (
         <div className="card p-12 text-center mb-6 flex flex-col items-center gap-4">
           <div className="spinner" />
-          <p className="muted">Preparing stream, downloading...</p>
+          <p className="muted">Preparing stream, downloading...{progress != null && ` ${progress}%`}</p>
         </div>
       )}
 

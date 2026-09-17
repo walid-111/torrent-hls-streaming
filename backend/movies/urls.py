@@ -9,4 +9,6 @@ urlpatterns = [
     path('<int:movie_id>/comments/', views.movie_comments),
     path('status/<int:movie_id>/', views.movie_status),
     path('<int:movie_id>/subtitles/', views.get_subtitles),
+    path('<int:movie_id>/progress/', views.watch_progress),
+    path('continue/', views.continue_watching),
 ]

@@ -6,7 +6,7 @@ from django.utils import timezone
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
-from .models import Movie, Comment
+from .models import Movie, Comment, WatchProgress
 from . import hls
 from .services import search_all, start_download, get_download, get_subtitle_text
 
@@ -56,6 +56,16 @@ def start_stream(request):
     if not magnet:
         return Response({'error': 'magnet required'}, status=400)
     movie, _ = Movie.objects.get_or_create(magnet=magnet, defaults={'title': title})
+    # keep the infos to show the movie in "continue watching"
+    for field in ('cover', 'summary'):
+        if request.data.get(field) and not getattr(movie, field):
+            setattr(movie, field, request.data[field])
+    for field, cast in (('year', int), ('rating', float)):
+        try:
+            if request.data.get(field) and getattr(movie, field) is None:
+                setattr(movie, field, cast(request.data[field]))
+        except (TypeError, ValueError):
+            pass
     movie.watched_by.add(request.user)
     movie.last_watched = timezone.now()
     movie.save()
@@ -188,3 +198,36 @@ def movie_comments(request, movie_id):
         'id': comment.id, 'author': comment.author.username,
         'content': comment.content, 'created_at': comment.created_at,
     }, status=201)
+
+@api_view(['GET', 'POST'])
+@permission_classes([IsAuthenticated])
+def watch_progress(request, movie_id):
+    if request.method == 'GET':
+        p = WatchProgress.objects.filter(user=request.user, movie_id=movie_id).first()
+        return Response({'position': p.position if p else 0})
+
+    try:
+        position = max(0.0, float(request.data.get('position', 0)))
+    except (TypeError, ValueError):
+        return Response({'error': 'invalid position'}, status=400)
+    if not Movie.objects.filter(id=movie_id).exists():
+        return Response({'error': 'Not found'}, status=404)
+    WatchProgress.objects.update_or_create(user=request.user, movie_id=movie_id, defaults={'position': position})
+    return Response({'position': position})
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def continue_watching(request):
+    # movies started but not finished (at least 1 min in, more than 2 min left)
+    result = []
+    for p in WatchProgress.objects.filter(user=request.user, position__gte=60).select_related('movie').order_by('-updated_at')[:10]:
+        m = p.movie
+        if m.length and p.position > m.length - 120:
+            continue
+        result.append({
+            'title': m.title, 'magnet': m.magnet, 'cover': m.cover, 'year': m.year,
+            'rating': m.rating, 'summary': m.summary, 'source': 'archive.org',
+            'position': p.position, 'length': m.length,
+        })
+    return Response(result)

@@ -27,3 +27,13 @@ class Comment(models.Model):
 
     def __str__(self):
         return f"{self.author.username} on {self.movie.title}"
+
+class WatchProgress(models.Model):
+    # where a user stopped in a movie, for "continue watching"
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='progress')
+    movie = models.ForeignKey(Movie, on_delete=models.CASCADE, related_name='progress')
+    position = models.FloatField(default=0)  # seconds
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = ('user', 'movie')

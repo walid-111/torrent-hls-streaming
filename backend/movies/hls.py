@@ -67,22 +67,26 @@ def has_failed(movie_id):
     return p is not None and p.poll() not in (None, 0)
 
 
-def _codecs(url):
+def _probe(url):
+    # codecs + duration, ffprobe goes through the raw endpoint too
     r = subprocess.run(
-        ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,codec_name', '-of', 'csv=p=0', url],
+        ['ffprobe', '-v', 'error', '-show_entries', 'stream=codec_type,codec_name:format=duration',
+         '-of', 'default=nw=1', url],
         capture_output=True, text=True, timeout=600
     )
-    video, audio = None, None
+    video, audio, duration, name = None, None, None, None
     for line in r.stdout.splitlines():
-        parts = line.strip().split(',')
-        if len(parts) < 2:
-            continue
-        name, kind = parts[0], parts[1]
-        if kind == 'video' and not video:
-            video = name
-        if kind == 'audio' and not audio:
-            audio = name
-    return video, audio
+        key, _, value = line.strip().partition('=')
+        if key == 'codec_name':
+            name = value
+        elif key == 'codec_type':
+            if value == 'video' and not video:
+                video = name
+            if value == 'audio' and not audio:
+                audio = name
+        elif key == 'duration' and value not in ('', 'N/A'):
+            duration = int(float(value))
+    return video, audio, duration
 
 
 def _command(url, out, video, audio):
@@ -122,7 +126,10 @@ def start(movie_id):
 
     def run():
         try:
-            video, audio = _codecs(url)
+            video, audio, duration = _probe(url)
+            if duration:
+                from .models import Movie
+                Movie.objects.filter(id=movie_id).update(length=duration)
             if not video:
                 print(f"Movie {movie_id}: ffprobe found no video stream", flush=True)
                 procs[movie_id] = subprocess.Popen(['false'])

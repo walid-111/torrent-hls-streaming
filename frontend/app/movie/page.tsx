@@ -6,31 +6,78 @@ import Hls from 'hls.js'
 
 const API = 'http://localhost:8000'
 
-function VideoPlayer({ movieId, subtitles }: { movieId: number, subtitles: any[] }) {
+function getCsrf() {
+  return document.cookie.split('; ').find(r => r.startsWith('csrftoken='))?.split('=')[1] || ''
+}
+
+function saveProgress(movieId: number, position: number) {
+  fetch(`${API}/internal/movies/${movieId}/progress/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCsrf() },
+    credentials: 'include',
+    keepalive: true, // still sent if the page is closing
+    body: JSON.stringify({ position }),
+  }).catch(() => {})
+}
+
+function VideoPlayer({ movieId, subtitles, resumeAt }: { movieId: number, subtitles: any[], resumeAt: number }) {
   const videoRef = useRef<HTMLVideoElement>(null)
 
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
     const url = `${API}/internal/movies/hls/${movieId}/index.m3u8`
+    let hls: Hls | null = null
 
     // chrome/firefox: hls.js. safari plays hls natively
     if (Hls.isSupported()) {
-      const hls = new Hls({
+      hls = new Hls({
         xhrSetup: xhr => { xhr.withCredentials = true }, // send the session cookie
+        // the playlist grows while ffmpeg works so hls.js thinks it's live and would start near the end
+        startPosition: 0,
       })
       hls.loadSource(url)
       hls.attachMedia(video)
       hls.on(Hls.Events.ERROR, (_, data) => {
         // segment not there yet or network hiccup: try again instead of dying
-        if (data.fatal && data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad()
-        else if (data.fatal && data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError()
+        if (data.fatal && data.type === Hls.ErrorTypes.NETWORK_ERROR) hls?.startLoad()
+        else if (data.fatal && data.type === Hls.ErrorTypes.MEDIA_ERROR) hls?.recoverMediaError()
       })
-      return () => hls.destroy()
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
       video.src = url
     }
-  }, [movieId])
+
+    // resume where the user stopped, once that part of the movie is ready
+    let resumed = resumeAt < 10
+    function tryResume() {
+      if (resumed || !video) return
+      const s = video.seekable
+      if (s.length && s.end(s.length - 1) > resumeAt + 1) {
+        video.currentTime = resumeAt
+        resumed = true
+      }
+    }
+    video.addEventListener('loadedmetadata', tryResume)
+    video.addEventListener('progress', tryResume)
+    const resumeTimer = setInterval(tryResume, 2000)
+
+    // save position every 10s while playing, and on pause / leaving
+    const saveTimer = setInterval(() => {
+      if (!video.paused && resumed) saveProgress(movieId, video.currentTime)
+    }, 10000)
+    const onPause = () => { if (resumed) saveProgress(movieId, video.currentTime) }
+    video.addEventListener('pause', onPause)
+
+    return () => {
+      if (resumed && video.currentTime > 0) saveProgress(movieId, video.currentTime)
+      clearInterval(resumeTimer)
+      clearInterval(saveTimer)
+      video.removeEventListener('loadedmetadata', tryResume)
+      video.removeEventListener('progress', tryResume)
+      video.removeEventListener('pause', onPause)
+      hls?.destroy()
+    }
+  }, [movieId, resumeAt])
 
   return (
     <video ref={videoRef} key={movieId} className="w-full rounded mb-6 card" controls autoPlay crossOrigin="use-credentials">
@@ -61,15 +108,12 @@ function MovieContent() {
   const [movieId, setMovieId] = useState<number | null>(null)
   const [streamReady, setStreamReady] = useState(false)
   const [progress, setProgress] = useState<number | null>(null)
+  const [resumeAt, setResumeAt] = useState<number | null>(null)
   const [noSeeders, setNoSeeders] = useState(false)
   const [comments, setComments] = useState<any[]>([])
   const [comment, setComment] = useState('')
   const [subtitles, setSubtitles] = useState<any[]>([])
   const startedRef = useRef(false)
-
-  function getCsrf() {
-    return document.cookie.split('; ').find(r => r.startsWith('csrftoken='))?.split('=')[1] || ''
-  }
 
   useEffect(() => {
     if (!ready || !magnet || startedRef.current) return
@@ -78,7 +122,7 @@ function MovieContent() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCsrf() },
       credentials: 'include',
-      body: JSON.stringify({ magnet, title }),
+      body: JSON.stringify({ magnet, title, cover, summary, rating, year }),
     })
       .then(r => {
         if (r.status === 503) { setNoSeeders(true); return null }
@@ -89,6 +133,8 @@ function MovieContent() {
         if (data.movie_id) {
           setMovieId(data.movie_id)
           loadComments(data.movie_id)
+          fetch(`${API}/internal/movies/${data.movie_id}/progress/`, { credentials: 'include' })
+            .then(r => r.json()).then(p => setResumeAt(p.position || 0)).catch(() => setResumeAt(0))
           loadSubtitles(data.movie_id)
         }
       })
@@ -182,8 +228,8 @@ function MovieContent() {
         </div>
       )}
 
-      {streamReady && movieId && (
-        <VideoPlayer movieId={movieId} subtitles={subtitles} />
+      {streamReady && movieId && resumeAt !== null && (
+        <VideoPlayer movieId={movieId} subtitles={subtitles} resumeAt={resumeAt} />
       )}
 
       <div className="card p-5">

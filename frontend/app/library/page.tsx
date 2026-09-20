@@ -13,6 +13,8 @@ interface Movie {
   watched?: boolean
   source?: string
   casting?: any
+  position?: number
+  length?: number | null
 }
 
 type SortKey = 'title' | 'year' | 'rating'
@@ -31,6 +33,7 @@ export default function LibraryPage() {
   const [sortKey, setSortKey] = useState<SortKey>('title')
   const [sortOrder, setSortOrder] = useState<SortOrder>('asc')
   const fetchingRef = useRef(false)
+  const [continueList, setContinueList] = useState<Movie[]>([])
 
   const fetchMovies = useCallback(async (pageNum: number, reset: boolean) => {
     if (fetchingRef.current) return
@@ -56,7 +59,12 @@ export default function LibraryPage() {
   }, [query, minYear, minRating, router])
 
   useEffect(() => {
-    if (ready) fetchMovies(1, true)
+    if (!ready) return
+    fetchMovies(1, true)
+    fetch('http://localhost:8000/internal/movies/continue/', { credentials: 'include' })
+      .then(r => r.json())
+      .then(data => setContinueList(Array.isArray(data) ? data : []))
+      .catch(() => {})
   }, [ready])
 
   const observerRef = useRef<IntersectionObserver | null>(null)
@@ -143,6 +151,27 @@ export default function LibraryPage() {
         <button className="btn" type="submit">Search</button>
         {loading && <div className="spinner" />}
       </form>
+
+      {continueList.length > 0 && (
+        <div className="mb-8">
+          <h2 className="font-bold mb-3">Continue watching</h2>
+          <div className="flex gap-4 overflow-x-auto pb-2">
+            {continueList.map((m, i) => (
+              <div key={i} onClick={() => openMovie(m)} className="card cursor-pointer overflow-hidden shrink-0" style={{ width: '160px' }}>
+                <div className="flex items-center justify-center" style={{ height: '120px', background: '#ece7dc' }}>
+                  {m.cover && <img src={m.cover} alt={m.title} className="max-h-full max-w-full object-contain" />}
+                </div>
+                {m.length ? (
+                  <div style={{ height: '3px', background: 'var(--border)' }}>
+                    <div style={{ height: '3px', width: `${Math.min(100, (m.position || 0) * 100 / m.length)}%`, background: 'var(--accent)' }} />
+                  </div>
+                ) : null}
+                <p className="p-2 text-sm font-semibold truncate">{m.title}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="flex gap-2 mb-6 items-center">
         <span className="muted text-sm">Sort:</span>

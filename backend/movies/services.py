@@ -265,9 +265,9 @@ def start_download(torrent_url, movie_id):
     handle.prioritize_files(priorities)
 
     dl = Download(handle, info, target)
-    # start of the file first for playback, and the end because a lot of mp4 have their index (moov atom) there
+    # start of the file first. not the end (where some mp4 have their index): web seeds would start downloading
+    # from there, ffmpeg asks for it when needed (http fallback or piece deadline)
     dl.want_range(0, 4 * 1024 * 1024)
-    dl.want_range(max(0, dl.size - 4 * 1024 * 1024), dl.size - 1)
     downloads[movie_id] = dl
     Movie.objects.filter(id=movie_id).update(folder=info.name())
 
